@@ -61,8 +61,7 @@ void handle_mouse(State& s) {
 }
 
 void draw_3d(State& s) {
-    // not used since we can't pass the joint values
-    const Target target = forward(s.robot, s.target);
+    const Target target = forward(s.robot, s.target, s.joint_values);
 
     ClearBackground(DARKGRAY);
     BeginMode3D(s.camera);
@@ -89,15 +88,18 @@ void draw_3d(State& s) {
                 }
             }
 
-            rlTranslatef(s.target.position.x(), s.target.position.y(), s.target.position.z());
-            // rotate to an angle axis from align and roll then draw
-            Eigen::AngleAxisd angle_axis(fromAlignRoll(s.target.align, s.target.roll));
-            rlRotatef(angle_axis.angle() * RAD2DEG, (float)angle_axis.axis().x(), (float)angle_axis.axis().y(), (float)angle_axis.axis().z());
-            DrawCylinderWiresEx({0, 0, 0}, {0, 0, 1.f}, 0.3f, 0.f, 8, ORANGE);
-
             for (int i = 0; i < 6; i++)
                 rlPopMatrix();
         rlPopMatrix();
+        
+        rlPushMatrix();
+            rlTranslatef((float)target.position.x(), (float)target.position.y(), (float)target.position.z());
+            // rotate to an angle axis from align and roll then draw
+            Eigen::AngleAxisd angle_axis(fromAlignRoll(target.align, target.roll));
+            rlRotatef(angle_axis.angle() * RAD2DEG, (float)angle_axis.axis().x(), (float)angle_axis.axis().y(), (float)angle_axis.axis().z());
+            DrawCylinderWiresEx({0, 0, 0}, {0, 0, 1.f}, 0.3f, 0.f, 8, ORANGE);
+        rlPopMatrix();
+        
     EndMode3D();
 }
 

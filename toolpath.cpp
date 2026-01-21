@@ -73,7 +73,7 @@ State init_state() {
 
     // create the local to world transform matrix that applies the same Y 225° rotation and corner translation as hardcoded in draw_3d
     Eigen::Matrix3d rotation = Eigen::AngleAxisd(225.0 * EIGEN_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
-    s.input.mesh_to_world = (Eigen::Translation3d(-(rotation * Eigen::Vector3d(-hSize, -hSize, -hSize))) * rotation).matrix();
+    s.input.mesh_to_world = (rotation * Eigen::Translation3d(hSize, hSize, hSize)).matrix();
     s.input.slicing_plane_normal = Eigen::Vector3d(0, 1, 0);
     s.input.kind = Input::Kind::Linear;
     
@@ -162,7 +162,7 @@ void draw_ui(const State& s) {
     DrawText(s.linear ? "Linear" : "Spiral",
              s.toggle.x + 15, s.toggle.y + 6, 20, WHITE);
     
-    auto drawSlider = [&](const State::Slider& config, double value) {
+    auto draw_slider = [&](const State::Slider& config, double value) {
         DrawText(TextFormat("%s: %.2f", config.label, value), config.rect.x, config.rect.y - 20, 16, WHITE);
         Rectangle fill = config.rect;
         fill.width *= (value - config.min) / (config.max - config.min);
@@ -171,13 +171,13 @@ void draw_ui(const State& s) {
     };
     
     if (s.linear) {
-        drawSlider(s.width, s.input.width);
-        drawSlider(s.height, s.input.height);
-        drawSlider(s.spacing, s.input.height_spacing);
+        draw_slider(s.width, s.input.width);
+        draw_slider(s.height, s.input.height);
+        draw_slider(s.spacing, s.input.height_spacing);
     } else {
-        drawSlider(s.factor, s.input.spiralizing_out_factor);
-        drawSlider(s.length, s.input.spiral_length);
-        drawSlider(s.step, s.input.spiral_step);
+        draw_slider(s.factor, s.input.spiralizing_out_factor);
+        draw_slider(s.length, s.input.spiral_length);
+        draw_slider(s.step, s.input.spiral_step);
     }
 }
 

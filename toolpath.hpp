@@ -41,7 +41,7 @@ struct Output
 Eigen::Vector3d get_first_point(const Input& input) {
     // turn each vertex from local to world space using homogeneous coords
     Eigen::MatrixXd V_world(input.V.rows(), 3);
-    for (int i = 0; i < input.V.rows(); ++i) {
+    for (int i = 0; i < input.V.rows(); i++) {
         Eigen::Vector4d v_homogenous(input.V(i, 0), input.V(i, 1), input.V(i, 2), 1.0);
         Eigen::Vector4d v_world = input.mesh_to_world * v_homogenous;
         V_world.row(i) = v_world.head<3>();
@@ -51,7 +51,7 @@ Eigen::Vector3d get_first_point(const Input& input) {
     Eigen::Vector3d normal = input.slicing_plane_normal.normalized();
     double min_distance = std::numeric_limits<double>::max();
     int min_i = 0;
-    for (int i = 0; i < V_world.rows(); ++i) {
+    for (int i = 0; i < V_world.rows(); i++) {
         Eigen::Vector3d v = V_world.row(i);
         double distance = v.dot(normal);
         if (distance < min_distance) {
@@ -83,7 +83,7 @@ Output ramping(const Input& input) {
     
     if (input.kind == Input::Kind::Linear) {
         // for each stacked line, alternate direction and draw from one end to the other at the current layer height
-        for (int layer = 0; layer <= input.height / input.height_spacing; ++layer) {
+        for (int layer = 0; layer <= input.height / input.height_spacing; layer++) {
             int sign = (layer % 2 == 0) ? 1 : -1;
             for (int side : {-sign, sign}) {
                 output.points.push_back(first_point + (side * 0.5 * input.width) * plane_x + (layer * input.height_spacing) * plane_y);
@@ -92,7 +92,7 @@ Output ramping(const Input& input) {
         }
     } else {
         // for each spiral step, draw the Archimedean spiral by converting polar to cartesian coordinates so we can use the plane axes
-        for (int i = 0; i <= input.spiral_length / input.spiral_step; ++i) {
+        for (int i = 0; i <= input.spiral_length / input.spiral_step; i++) {
             double angle = i * input.spiral_step;
             output.points.push_back(first_point + (input.spiralizing_out_factor * angle) * (std::cos(angle) * plane_x + std::sin(angle) * plane_y));
             output.orientation.push_back(normal);

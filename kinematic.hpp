@@ -20,8 +20,8 @@ struct Axis {
 
 	Kind kind;
 
-	Eigen::Vector3d pivot;
-	Eigen::Vector3d pivotNormal;
+	Eigen::Vector3d pivot; // position, the point the joint rotates around or slides from (joint's origin)
+	Eigen::Vector3d pivotNormal; // the axis direction for rotation (ignored for linear joints)
 
 	Eigen::Vector3d segmentA;
 	Eigen::Vector3d segmentB;
@@ -33,16 +33,21 @@ struct Robot {
 	Eigen::Matrix4d transform;
 };
 
-Target forward(const Robot& robot, const Target& tip_target) {
-	// build the cumulative transform by chaining pivot translations
-    // incomplete because missing actual joint rotations...
+Target forward(const Robot& robot, const Target& tip_target, const std::array<float, 6> &joint_values) {
+    // build the cumulative transform by chaining pivot translations
     Eigen::Matrix4d cumulative_transform = robot.transform;
-    for (const auto& axis : robot.axes) {
+    for (size_t i = 0; i < robot.axes.size(); i++) {
+        const auto& axis = robot.axes[i];
         Eigen::Matrix4d local_transform = Eigen::Matrix4d::Identity();
         local_transform.block<3,1>(0,3) = axis.pivot;
+        if (axis.kind == Axis::Kind::Rotary) {
+            local_transform.block<3,3>(0,0) = Eigen::AngleAxisd(joint_values[i], axis.pivotNormal).toRotationMatrix();
+        } else {
+            local_transform(0, 3) += joint_values[i];
+        }
         cumulative_transform *= local_transform;
     }
-	// transform tip_target from end-effector space to robot base space
+    // transform tip_target from end-effector space to robot base space
     Target result = tip_target;
     result.position = (cumulative_transform * tip_target.position.homogeneous()).head<3>();
     result.align = (cumulative_transform.block<3,3>(0,0) * tip_target.align).normalized();
@@ -69,7 +74,3 @@ std::pair<Eigen::Vector3d, double> toAlignRoll(const Eigen::Quaterniond& quat) {
     }
     return {align, roll};
 }
-
-// I didn't get to use segmentA and segmentB since pivot and pivotNormal suffice for both (simply toggling changes their use)
-// I didn't get to use the functions since forward doesn't take the joints values so there'd be no way to "attach" it onto
-// the last axis as it's in local coords
