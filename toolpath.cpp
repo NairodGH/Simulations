@@ -34,6 +34,7 @@ State init_state() {
     s.camera.position = {1.5f, 4.f, 36.f};
     s.camera.up = {0.f, 1.f, 0.f};
 
+    // to fit the given schema, simply rotate the camera (instead of rotating the whole world<..) by 45° on Z
     float angle = 45.0f * DEG2RAD;
     float cos_a = cosf(angle);
     float sin_a = sinf(angle);
@@ -86,7 +87,7 @@ State init_state() {
         0, 5, 3, 0, 3, 7,
         6, 4, 1, 6, 1, 2;
 
-    // create the local to world transform matrix that applies the same Y 225° rotation and corner translation as hardcoded in draw_3d
+    // create the local to world transform matrix that rotates and translates the cube so it stands on one of its corners
     Eigen::Matrix3d rotation = Eigen::AngleAxisd(270.0 * EIGEN_PI / 180.0, Eigen::Vector3d(1, 1, 0).normalized()).toRotationMatrix();
     s.input.mesh_to_world = (rotation * Eigen::Translation3d(hSize, hSize, hSize)).matrix();
     s.input.slicing_plane_normal = Eigen::Vector3d(0, 1, 0);
@@ -141,6 +142,7 @@ void draw_3d(const State& s) {
     const Output ramp = ramping(s.input);
 
     ClearBackground(DARKGRAY);
+    // no rlPushMatrix needed since the camera and cube are already handled in init_state so just draw plane, normal, ramp and cube
     BeginMode3D(s.camera);
         DrawCubeWires({0, 0, 0}, 30.f, 0.01f, 30.f, ORANGE);
         DrawLine3D({0, 0, 0}, {0, s.cube_size, 0}, s.linear ? BLUE : PURPLE);
@@ -155,20 +157,21 @@ void draw_3d(const State& s) {
             DrawLine3D(p1, p2, s.linear ? BLUE : PURPLE);
         }
 
+        // draw the cube from F faces' V vertices into world space
         rlBegin(RL_LINES);
             for (int i = 0; i < s.input.F.rows(); i++) {
                 for (int j = 0; j < 3; j++) {
                     int v1 = s.input.F(i, j);
                     int v2 = s.input.F(i, (j + 1) % 3);
                     
-                    Eigen::Vector4d p1_h(s.input.V(v1, 0), s.input.V(v1, 1), s.input.V(v1, 2), 1.0);
-                    Eigen::Vector4d p2_h(s.input.V(v2, 0), s.input.V(v2, 1), s.input.V(v2, 2), 1.0);
-                    Eigen::Vector4d p1_world = s.input.mesh_to_world * p1_h;
-                    Eigen::Vector4d p2_world = s.input.mesh_to_world * p2_h;
+                    Eigen::Vector4d v1_local(s.input.V(v1, 0), s.input.V(v1, 1), s.input.V(v1, 2), 1.0);
+                    Eigen::Vector4d v2_local(s.input.V(v2, 0), s.input.V(v2, 1), s.input.V(v2, 2), 1.0);
+                    Eigen::Vector4d v1_world = s.input.mesh_to_world * v1_local;
+                    Eigen::Vector4d v2_world = s.input.mesh_to_world * v2_local;
                     
                     rlColor4ub(255, 165, 0, 255);
-                    rlVertex3f(p1_world.x(), p1_world.y(), p1_world.z());
-                    rlVertex3f(p2_world.x(), p2_world.y(), p2_world.z());
+                    rlVertex3f(v1_world.x(), v1_world.y(), v1_world.z());
+                    rlVertex3f(v2_world.x(), v2_world.y(), v2_world.z());
                 }
             }
         rlEnd();

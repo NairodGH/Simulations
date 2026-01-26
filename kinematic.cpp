@@ -147,7 +147,7 @@ void draw_ui(State& s) {
 
 int main() {
     SetTraceLogLevel(LOG_NONE);
-    InitWindow(1280, 720, "Kinematics");
+    InitWindow(1280, 720, "Kinematic");
     State state = init_state();
     SetTargetFPS(60);
     while (!WindowShouldClose()) {
