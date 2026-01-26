@@ -63,7 +63,7 @@ State init_state() {
 
     const float hSize = s.cube_size / 2.f;
 
-    // not used but define the cube vertices around its origin by simply going through every x y z halfSize configurations
+    // define the cube vertices around its origin by simply going through every x y z halfSize configurations
     // order doesn't really matter as long as their respective faces are referenced correctly
     s.input.V.resize(8, 3);
     s.input.V <<
@@ -76,7 +76,7 @@ State init_state() {
         hSize, -hSize, hSize,
         hSize, hSize, -hSize;
 
-    // not used but define the cube's 6 faces with 2 triangles each, referencing their vertices accordingly
+    // define the cube's 6 faces with 2 triangles each, referencing their vertices accordingly
     s.input.F.resize(12, 3);
     s.input.F <<
         0, 6, 2, 0, 2, 5,
@@ -87,7 +87,7 @@ State init_state() {
         6, 4, 1, 6, 1, 2;
 
     // create the local to world transform matrix that applies the same Y 225° rotation and corner translation as hardcoded in draw_3d
-    Eigen::Matrix3d rotation = Eigen::AngleAxisd(225.0 * EIGEN_PI / 180.0, Eigen::Vector3d::UnitY()).toRotationMatrix();
+    Eigen::Matrix3d rotation = Eigen::AngleAxisd(270.0 * EIGEN_PI / 180.0, Eigen::Vector3d(1, 1, 0).normalized()).toRotationMatrix();
     s.input.mesh_to_world = (rotation * Eigen::Translation3d(hSize, hSize, hSize)).matrix();
     s.input.slicing_plane_normal = Eigen::Vector3d(0, 1, 0);
     s.input.kind = Input::Kind::Linear;
@@ -142,28 +142,36 @@ void draw_3d(const State& s) {
 
     ClearBackground(DARKGRAY);
     BeginMode3D(s.camera);
-        rlPushMatrix();
-            DrawCubeWires({0, 0, 0}, 30.f, 0.01f, 30.f, ORANGE);
-            DrawLine3D({0, 0, 0}, {0, s.cube_size, 0}, s.linear ? BLUE : PURPLE);
+        DrawCubeWires({0, 0, 0}, 30.f, 0.01f, 30.f, ORANGE);
+        DrawLine3D({0, 0, 0}, {0, s.cube_size, 0}, s.linear ? BLUE : PURPLE);
 
-            for (size_t i = 0; i < ramp.points.size() - 1; i++) {
-                Vector3 p1 = {(float)ramp.points[i].x(),
-                            (float)ramp.points[i].y(),
-                            (float)ramp.points[i].z()};
-                Vector3 p2 = {(float)ramp.points[i + 1].x(),
-                            (float)ramp.points[i + 1].y(),
-                            (float)ramp.points[i + 1].z()};
-                DrawLine3D(p1, p2, s.linear ? BLUE : PURPLE);
+        for (size_t i = 0; i < ramp.points.size() - 1; i++) {
+            Vector3 p1 = {(float)ramp.points[i].x(),
+                        (float)ramp.points[i].y(),
+                        (float)ramp.points[i].z()};
+            Vector3 p2 = {(float)ramp.points[i + 1].x(),
+                        (float)ramp.points[i + 1].y(),
+                        (float)ramp.points[i + 1].z()};
+            DrawLine3D(p1, p2, s.linear ? BLUE : PURPLE);
+        }
+
+        rlBegin(RL_LINES);
+            for (int i = 0; i < s.input.F.rows(); i++) {
+                for (int j = 0; j < 3; j++) {
+                    int v1 = s.input.F(i, j);
+                    int v2 = s.input.F(i, (j + 1) % 3);
+                    
+                    Eigen::Vector4d p1_h(s.input.V(v1, 0), s.input.V(v1, 1), s.input.V(v1, 2), 1.0);
+                    Eigen::Vector4d p2_h(s.input.V(v2, 0), s.input.V(v2, 1), s.input.V(v2, 2), 1.0);
+                    Eigen::Vector4d p1_world = s.input.mesh_to_world * p1_h;
+                    Eigen::Vector4d p2_world = s.input.mesh_to_world * p2_h;
+                    
+                    rlColor4ub(255, 165, 0, 255);
+                    rlVertex3f(p1_world.x(), p1_world.y(), p1_world.z());
+                    rlVertex3f(p2_world.x(), p2_world.y(), p2_world.z());
+                }
             }
-
-            // cube mesh is inside the world so untilt it, rotate it so the plane normal "skews" it
-            // and make it "rest" on one of its corners
-            rlPushMatrix();
-                rlRotatef(270.f, 1, 1, 0);
-                rlTranslatef(s.cube_size / 2.f, s.cube_size / 2.f, s.cube_size / 2.f);
-                DrawCubeWires({0, 0, 0}, s.cube_size, s.cube_size, s.cube_size, ORANGE);
-            rlPopMatrix();
-        rlPopMatrix();
+        rlEnd();
     EndMode3D();
 }
 
