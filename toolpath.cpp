@@ -31,8 +31,23 @@ State init_state() {
     s.cube_size = 6.f;
     
     s.camera = {0};
-    s.camera.position = {-3.f, 2.f, -36.f};
+    s.camera.position = {1.5f, 4.f, 36.f};
     s.camera.up = {0.f, 1.f, 0.f};
+
+    float angle = 45.0f * DEG2RAD;
+    float cos_a = cosf(angle);
+    float sin_a = sinf(angle);
+    // rotate position
+    float x = s.camera.position.x;
+    float y = s.camera.position.y;
+    s.camera.position.x = x * cos_a - y * sin_a;
+    s.camera.position.y = x * sin_a + y * cos_a;
+    // rotate up vector
+    x = s.camera.up.x;
+    y = s.camera.up.y;
+    s.camera.up.x = x * cos_a - y * sin_a;
+    s.camera.up.y = x * sin_a + y * cos_a;
+    
     s.camera.fovy = s.cube_size * 10.f;
     s.camera.projection = CAMERA_PERSPECTIVE;
     
@@ -128,8 +143,6 @@ void draw_3d(const State& s) {
     ClearBackground(DARKGRAY);
     BeginMode3D(s.camera);
         rlPushMatrix();
-            //rotate the world 45°, I should've maybe simply rotated the camera instead to avoid many problems...
-            rlRotatef(45.f, 0, 0, 1);
             DrawCubeWires({0, 0, 0}, 30.f, 0.01f, 30.f, ORANGE);
             DrawLine3D({0, 0, 0}, {0, s.cube_size, 0}, s.linear ? BLUE : PURPLE);
 
@@ -146,8 +159,7 @@ void draw_3d(const State& s) {
             // cube mesh is inside the world so untilt it, rotate it so the plane normal "skews" it
             // and make it "rest" on one of its corners
             rlPushMatrix();
-                rlRotatef(-45.f, 0, 0, 1);
-                rlRotatef(225.f, 0, 1, 0);
+                rlRotatef(270.f, 1, 1, 0);
                 rlTranslatef(s.cube_size / 2.f, s.cube_size / 2.f, s.cube_size / 2.f);
                 DrawCubeWires({0, 0, 0}, s.cube_size, s.cube_size, s.cube_size, ORANGE);
             rlPopMatrix();
@@ -161,7 +173,7 @@ void draw_ui(const State& s) {
     DrawRectangleRec(s.toggle, s.linear ? BLUE : PURPLE);
     DrawText(s.linear ? "Linear" : "Spiral",
              s.toggle.x + 15, s.toggle.y + 6, 20, WHITE);
-    
+    DrawText(TextFormat("Camera: X=%.2f Y=%.2f Z=%.2f", s.camera.position.x, s.camera.position.y, s.camera.position.z), 10, 10, 20, WHITE);
     auto draw_slider = [&](const State::Slider& config, double value) {
         DrawText(TextFormat("%s: %.2f", config.label, value), config.rect.x, config.rect.y - 20, 16, WHITE);
         Rectangle fill = config.rect;
