@@ -173,7 +173,7 @@ void draw_ui(const State& s) {
     DrawRectangleRec(s.toggle, s.linear ? BLUE : PURPLE);
     DrawText(s.linear ? "Linear" : "Spiral",
              s.toggle.x + 15, s.toggle.y + 6, 20, WHITE);
-    DrawText(TextFormat("Camera: X=%.2f Y=%.2f Z=%.2f", s.camera.position.x, s.camera.position.y, s.camera.position.z), 10, 10, 20, WHITE);
+
     auto draw_slider = [&](const State::Slider& config, double value) {
         DrawText(TextFormat("%s: %.2f", config.label, value), config.rect.x, config.rect.y - 20, 16, WHITE);
         Rectangle fill = config.rect;

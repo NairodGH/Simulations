@@ -70,31 +70,20 @@ Output ramping(const Input& input) {
     Eigen::Vector3d first_point = get_first_point(input);
     Eigen::Vector3d normal = input.slicing_plane_normal.normalized();
     
-    // since I tilted the plane 45° to fit the schemas, drawing on it would have to take it into account everytime...
-    // so I instead simply create a new coordinate system that's parallel to the plane, made up of 2 axes perpendicular to themselves and the normal
-    // (if I didn't tilt the plane I wouldn't need it but this makes it adaptable to any rotation)
-    Eigen::Vector3d plane_x, plane_y;
-    if (std::abs(normal.z()) < 0.9) {
-        plane_x = Eigen::Vector3d(0, 0, 1).cross(normal).normalized();
-    } else {
-        plane_x = Eigen::Vector3d(1, 0, 0).cross(normal).normalized();
-    }
-    plane_y = normal.cross(plane_x).normalized();
-    
     if (input.kind == Input::Kind::Linear) {
         // for each stacked line, alternate direction and draw from one end to the other at the current layer height
         for (int layer = 0; layer <= input.height / input.height_spacing; layer++) {
             int sign = (layer % 2 == 0) ? 1 : -1;
             for (int side : {-sign, sign}) {
-                output.points.push_back(first_point + (side * 0.5 * input.width) * plane_x + (layer * input.height_spacing) * plane_y);
+                output.points.push_back(first_point + (side * 0.5 * input.width) * Eigen::Vector3d(1, 0, 0) + (layer * input.height_spacing) * Eigen::Vector3d(0, 0, 1));
                 output.orientation.push_back(normal);
             }
         }
     } else {
-        // for each spiral step, draw the Archimedean spiral by converting polar to cartesian coordinates so we can use the plane axes
+        // for each spiral step, draw the Archimedean spiral by converting polar to cartesian coordinates
         for (int i = 0; i <= input.spiral_length / input.spiral_step; i++) {
             double angle = i * input.spiral_step;
-            output.points.push_back(first_point + (input.spiralizing_out_factor * angle) * (std::cos(angle) * plane_x + std::sin(angle) * plane_y));
+            output.points.push_back(first_point + (input.spiralizing_out_factor * angle) * (std::cos(angle) * Eigen::Vector3d(1, 0, 0) + std::sin(angle) * Eigen::Vector3d(0, 0, 1)));
             output.orientation.push_back(normal);
         }
     }
