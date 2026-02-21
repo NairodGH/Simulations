@@ -1,9 +1,6 @@
-#include <Eigen/Dense>
-#include <raylib.h>
-#include <raymath.h>
-#include <rlgl.h>
+#include "main.hpp"
 
-// This is the original file I was given as a .cpp
+// This is a technical test file I was given as a .cpp, it suffices for my prototype so I built upon it
 // all the comments have been removed so people can't just search them up to cheat using my solution
 
 struct Input

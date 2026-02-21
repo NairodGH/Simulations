@@ -21,8 +21,22 @@ set(EIGEN_BUILD_DOC OFF CACHE BOOL "" FORCE)
 set(EIGEN_BUILD_TESTING OFF CACHE BOOL "" FORCE)
 FetchContent_MakeAvailable(Eigen)
 
-add_executable(toolpath toolpath.cpp)
-target_link_libraries(toolpath raylib Eigen3::Eigen)
+set(CMAKE_BUILD_TYPE Release CACHE STRING "Default to Release for O2" FORCE)
+if(MSVC)
+    add_compile_options(/O2 /arch:AVX2)
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-O2 -mavx2)
+endif()
 
-add_executable(kinematic kinematic.cpp)
-target_link_libraries(kinematic raylib Eigen3::Eigen)
+include_directories(include)
+
+set(LIBS raylib Eigen3::Eigen)
+
+add_executable(toolpath src/toolpath.cpp)
+target_link_libraries(toolpath ${LIBS})
+
+add_executable(kinematic src/kinematic.cpp)
+target_link_libraries(kinematic ${LIBS})
+
+add_executable(soup src/soup.cpp)
+target_link_libraries(soup ${LIBS})
