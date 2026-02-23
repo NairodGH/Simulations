@@ -45,3 +45,13 @@ Drag on the scene to pan around X.
 Click on the "Axis 0 linear" toggle to switch back and forth between it and the "rotary" kind (not possible on the other axes since it'd break the arm).\
 Drag the sliders to change their respective values.\
 Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
+
+# <p align="center">🍲 Soup 🦠</p>
+
+<p align="center">
+    <a href="https://en.wikipedia.org/wiki/Primordial_soup">
+        <img src="assets/soup.gif">
+    </a>
+</p>
+
+[Artificial life](https://en.wikipedia.org/wiki/Artificial_life) [particle method](https://en.wikipedia.org/wiki/Particle_method) [N-body simulation](https://en.wikipedia.org/wiki/N-body_simulation) exploring [emergent behavior](https://en.wikipedia.org/wiki/Emergence) inspired by the [primordial soup](https://en.wikipedia.org/wiki/Primordial_soup).
