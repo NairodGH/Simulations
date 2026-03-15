@@ -40,3 +40,6 @@ target_link_libraries(kinematic ${LIBS})
 
 add_executable(soup src/soup.cpp)
 target_link_libraries(soup ${LIBS})
+
+add_executable(cad src/cad.cpp)
+target_link_libraries(cad ${LIBS})
