@@ -1,0 +1,6 @@
+{
+    "cmake.buildBeforeRun": true,
+    "cmake.configureOnOpen": true,
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "files.autoSave": "onFocusChange"
+}

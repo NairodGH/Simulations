@@ -742,12 +742,15 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
 
 #pragma region uv grid
 // U and V are just parameter names for the two axes of a surface's own coordinate system, the same way X/Y are axes in world space,
-// a cylinder has U = angle around the axis and V = height along it, sample a grid of (U, V) pairs, evaluate the surface formula at each one to get a 3D point,
-// connect adjacent points into quads → triangles, it' called a UV grid because you are marching across the surface's parameter space in a regular grid pattern
-// tesselation (cylinders & tori), projecting a cylinder boundary onto a flat plane gives two overlapping circles, the ear-clipper produces garbage,
+// a cylinder has U = angle around the axis (0 to 2π for a full revolution) and V = height along it (heightMin to heightMax),
+// imagine you need to wallpaper a cylindrical pillar, just unroll a rectangular sheet and wrap it around, that's the UV grid
+// projecting a cylinder boundary onto a flat plane would give two overlapping circles, the ear-clipper would produce garbage,
 // instead we tessellate the surface analytically in (u,v) parameter space and emit a clean quad grid
 // "analytically" here means the normal or position is computed from the closed-form mathematical definition of the surface
 // rather than estimated by, say, averaging the normals of surrounding triangles (tldr exact formula, no approximation)
+// inversely, we couldn't use this amazing UV grid for planes because it does not have a natural parameter space like cylinder's and tori's
+// angle and height, a plane is infinite and has no intrinsic coordinate system (you have to invent one, tangentX/tangentY) and
+// its boundary shape can be absolutely anything, hence why a recursive exploratory algorithm like ear-clipper is better
 
 // appends a single vertex (position + normal) to the flat float arrays of a TessellatedFace
 // ex: pos=(1,0,0), nor=(1,0,0) -> pushes 6 floats: vertices=[...,1,0,0], normals=[...,1,0,0]

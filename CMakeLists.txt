@@ -33,7 +33,7 @@ FetchContent_MakeAvailable(Eigen)
 
 set(LIBS raylib Eigen3::Eigen)
 
-set(TARGETS toolpath kinematic soup cad)
+set(TARGETS toolpath kinematic soup cad ppi)
 
 foreach(T IN LISTS TARGETS)
     add_executable(${T} src/${T}.cpp)

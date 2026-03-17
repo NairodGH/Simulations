@@ -66,3 +66,16 @@ Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
 
 Minimal [STEP](https://en.wikipedia.org/wiki/ISO_10303) file loader (cylinders, planes and tori with their relevant keywords for rendering, everything else (styling, metadata, presentation, assembly) is ignored) and [tessellator](https://en.wikipedia.org/wiki/Tessellation_(computer_graphics)) for [B-rep](https://en.wikipedia.org/wiki/Boundary_representation) to [mesh](https://en.wikipedia.org/wiki/Polygon_mesh) visualization.\
 Drag on the scene to pan around and scroll the mouse wheel to zoom/unzoom.
+
+# <p align="center">📟 PPI ᯤ</p>
+
+<p align="center">
+    <a href="https://en.wikipedia.org/wiki/Plan_position_indicator">
+        <img src="assets/ppi.gif">
+    </a>
+</p>
+
+Real-time PPI [sonar](https://en.wikipedia.org/wiki/Sonar) display simulating active and passive detection modes, two-way [transmission loss](https://en.wikipedia.org/wiki/Transmission_loss), [thermocline](https://en.wikipedia.org/wiki/Thermocline)-induced shadow zones, and a depth-varying [sound speed profile](https://en.wikipedia.org/wiki/Sound_speed_profile).\
+Assumes we're a surface vessel with sonar [transducer](https://en.wikipedia.org/wiki/Transducer) pointing downward towards submarines/whales/etc...\
+Click on the "Active" toggle to switch back and forth between it and the "Passive" mode.\
+Drag the sliders to change their respective values.
