@@ -80,6 +80,12 @@ struct StepEntity {
 };
 using StepMap = std::unordered_map<int, StepEntity>;
 
+// one entry on the undo/redo stack, which face moved and what its offset was before the move began
+struct UndoEntry {
+    int faceIndex;
+    Vector3 offsetBefore;
+};
+
 // final GPU model
 struct CadModel {
     std::vector<Mesh> meshes;
@@ -92,5 +98,7 @@ struct CadModel {
     int totalTriangleCount = 0;
     int selectedFace = -1;
     int distFace = -1;
+    std::vector<UndoEntry> undoStack; // pushed once per translation gesture (on first IsKeyPressed of a drag)
+    std::vector<UndoEntry> redoStack; // cleared on new translation, populated by undo
     ~CadModel();
 };

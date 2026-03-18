@@ -1629,6 +1629,9 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
     // push/pull: move selected face along its surface's own axes
     // UP/DOWN = zDir (normal for planes, axis for cylinders/tori), LEFT/RIGHT = xDir (in-plane tangent), PgUp/PgDn = yDir (zDir×xDir)
     // step size = 0.5% of model diagonal per frame, Shift multiplies by 10
+    // wasTranslating detects the rising edge of a translation gesture so one continuous hold = one undo entry
+    static bool wasTranslating = false;
+    bool translating = false;
     if (model.selectedFace > -1) {
         float step = diagonal * 0.005f;
         if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
@@ -1638,6 +1641,13 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         Vec3 xDir = surf.axis.xDir.norm();
         Vec3 yDir = zDir.cross(xDir).norm();
         Vector3& off = model.faceOffsets[model.selectedFace];
+        translating = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT)
+            || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
+        if (translating && !wasTranslating) {
+            model.undoStack.push_back({ model.selectedFace, off });
+            model.redoStack.clear();
+        }
+        wasTranslating = translating;
         if (IsKeyDown(KEY_UP)) {
             off.x += (float)zDir.x * step;
             off.y += (float)zDir.y * step;
@@ -1667,6 +1677,29 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
             off.x -= (float)yDir.x * step;
             off.y -= (float)yDir.y * step;
             off.z -= (float)yDir.z * step;
+        }
+    } else {
+        wasTranslating = false;
+    }
+
+    // (ctrl+z is swallowed by the Win32 message loop as ASCII SUB before Raylib sees the key event XDD)
+    // both blocked while any translation key is held to prevent stomping an in-progress gesture
+    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_U)) {
+        if (!model.undoStack.empty()) {
+            UndoEntry entry = model.undoStack.back();
+            model.undoStack.pop_back();
+            model.redoStack.push_back({ entry.faceIndex, model.faceOffsets[entry.faceIndex] });
+            model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
+            model.selectedFace = entry.faceIndex;
+        }
+    }
+    if (!translating && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)) && IsKeyPressed(KEY_Y)) {
+        if (!model.redoStack.empty()) {
+            UndoEntry entry = model.redoStack.back();
+            model.redoStack.pop_back();
+            model.undoStack.push_back({ entry.faceIndex, model.faceOffsets[entry.faceIndex] });
+            model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
+            model.selectedFace = entry.faceIndex;
         }
     }
 
@@ -1712,7 +1745,7 @@ static void drawUI(const CadModel& model)
     uiY += uiStep;
     DrawText("N = normals | B = bounding box", 20, uiY, 16, LIGHTGRAY);
     uiY += uiStep;
-    DrawText("Arrows/page keys = translate face (Shift = faster)", 20, uiY, 16, LIGHTGRAY);
+    DrawText("Arrows/page keys = translate face | Ctrl+U/Y = undo/redo", 20, uiY, 16, LIGHTGRAY);
     uiY += uiStep;
 
     if (model.selectedFace < 0)
