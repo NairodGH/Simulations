@@ -1044,7 +1044,8 @@ static TessellatedFace tessPlane(const Surface& surface, std::vector<BoundaryLoo
 }
 
 #pragma region advanced_face
-static TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs)
+//  if outSurface non-null, the resolved surface is written out for callers that need the analytical definition after tessellation
+static TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr)
 {
     auto faceIt = map.find(faceId);
     if (faceIt == map.end())
@@ -1062,6 +1063,9 @@ static TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, in
     // orientation_flag ".F." means the face normal is opposite to the surface normal
     // ex: inner wall of a hollow cylinder has ".F." so the normal points inward
     bool faceReversed = (faceParams.size() >= 4 && trimWS(faceParams[3]) == ".F.");
+
+    if (outSurface)
+        *outSurface = surface;
 
     // sample all boundary loops, converts the topological boundary description (a chain of edge references)
     // into an actual ordered list of 3D points forming a closed polygon aka "what is the outline of this face"
@@ -1095,8 +1099,41 @@ static Color colorForKind(SurfaceKind kind)
     case SurfaceKind::Plane:
         return BLUE;
     default:
-        return GRAY;
+        return DARKGRAY;
     }
+}
+
+// human-readable label for each surface type, used in the stats panel
+static const char* surfaceKindName(SurfaceKind kind)
+{
+    switch (kind) {
+    case SurfaceKind::Plane:
+        return "Plane";
+    case SurfaceKind::Cylinder:
+        return "Cylinder";
+    case SurfaceKind::Torus:
+        return "Torus";
+    default:
+        return "Unknown";
+    }
+}
+
+// sums the area of all front-face triangles (first half of the index list, back-face duplicates are the second half)
+// exact for planar faces (ear-clip triangulates the exact boundary), approximate for curved surfaces (depends on arcSegs)
+static float computeFaceArea(const TessellatedFace& face)
+{
+    float area = 0.0f;
+    // total triangles / 2 = front-face triangles only (back faces are duplicated with reversed winding in the second half)
+    int frontTriCount = (int)face.indices.size() / 6;
+    for (int i = 0; i < frontTriCount; i++) {
+        int base = i * 3;
+        int i0 = face.indices[base] * 3, i1 = face.indices[base + 1] * 3, i2 = face.indices[base + 2] * 3;
+        Vec3 v0 = { face.vertices[i0], face.vertices[i0 + 1], face.vertices[i0 + 2] };
+        Vec3 v1 = { face.vertices[i1], face.vertices[i1 + 1], face.vertices[i1 + 2] };
+        Vec3 v2 = { face.vertices[i2], face.vertices[i2 + 1], face.vertices[i2 + 2] };
+        area += 0.5f * (float)(v1 - v0).cross(v2 - v0).len();
+    }
+    return area;
 }
 
 // allocates and fills a Raylib Mesh from a TessellatedFace, then uploads it from CPU RAM to the GPU's to draw it later
@@ -1150,7 +1187,8 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
 
     // for each advanced face, by ID, go down its IDs nesting to resolve the face (shape) and add it to the model
     for (int faceId : faceIds) {
-        TessellatedFace tessellatedFace = tessellateAdvancedFace(faceId, entityMap, arcSegs);
+        Surface faceSurface;
+        TessellatedFace tessellatedFace = tessellateAdvancedFace(faceId, entityMap, arcSegs, &faceSurface);
         if (tessellatedFace.indices.empty())
             continue;
         // expand the overall bounding box with all vertices of this face
@@ -1166,10 +1204,21 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
         Mesh mesh = uploadMesh(tessellatedFace);
         if (mesh.vertexCount == 0)
             continue;
+        // all parallel arrays stay in sync, one entry per successfully uploaded face
         model.meshes.push_back(mesh);
         model.colors.push_back(colorForKind(tessellatedFace.kind));
+        model.pickData.push_back(tessellatedFace);
+        model.faceSurfaces.push_back(faceSurface);
+        model.faceAreas.push_back(computeFaceArea(tessellatedFace));
+        model.totalTriangleCount += (int)tessellatedFace.indices.size() / 6; // front triangles only
     }
     return model;
+}
+
+// returns the bbox center in original STEP space, used to undo the centering applied in drawCadModel
+static Vector3 modelCenter(const CadModel& model)
+{
+    return { (model.bbox.min.x + model.bbox.max.x) * 0.5f, (model.bbox.min.y + model.bbox.max.y) * 0.5f, (model.bbox.min.z + model.bbox.max.z) * 0.5f };
 }
 
 void drawCadModel(const CadModel& model)
@@ -1193,6 +1242,267 @@ void drawCadModel(const CadModel& model)
         UnloadMaterial(material); // else will leak every frame for every mesh, not the most efficient but fine at this scale
     }
     rlEnableBackfaceCulling();
+}
+
+#pragma region picking
+// Möller–Trumbore ray-triangle intersection: parameterizes the triangle as v0 + u*(v1-v0) + v*(v2-v0),
+// solves for the ray parameter t (distance along the ray to the hit), returns t > 0 or -1 if no intersection
+// ex: ray pointing at a triangle 5 units away -> returns ~5.0, ray parallel or pointing away -> -1
+static float rayTriangleIntersect(Ray ray, Vec3 v0, Vec3 v1, Vec3 v2)
+{
+    const float epsilon = 1e-8f;
+    Vec3 edge1 = v1 - v0, edge2 = v2 - v0;
+    Vec3 rayDir = { ray.direction.x, ray.direction.y, ray.direction.z };
+    Vec3 h = rayDir.cross(edge2);
+    float det = (float)edge1.dot(h);
+    // ray is parallel to the triangle plane (dot product of edge and perpendicular is ~0)
+    if (std::abs(det) < epsilon)
+        return -1.0f;
+    float invDet = 1.0f / det;
+    Vec3 rayOrig = { ray.position.x, ray.position.y, ray.position.z };
+    Vec3 s = rayOrig - v0;
+    // u is the barycentric coordinate along edge1, must be in [0,1] to be inside the triangle
+    float u = (float)s.dot(h) * invDet;
+    if (u < 0.0f || u > 1.0f)
+        return -1.0f;
+    Vec3 q = s.cross(edge1);
+    // v is the barycentric coordinate along edge2, u+v must also stay <= 1
+    float v = (float)rayDir.dot(q) * invDet;
+    if (v < 0.0f || u + v > 1.0f)
+        return -1.0f;
+    float t = (float)edge2.dot(q) * invDet;
+    // t must be positive (hit is in front of the ray origin, not behind)
+    return t > epsilon ? t : -1.0f;
+}
+
+// tests the ray against every triangle of every face and returns the index of the closest hit face, -1 if nothing hit
+// adds bbox center back to the ray so it's in the same space as the vertex data (drawCadModel subtracts the center)
+static int pickFace(const CadModel& model, Ray ray)
+{
+    Vector3 center = modelCenter(model);
+    ray.position.x += center.x;
+    ray.position.y += center.y;
+    ray.position.z += center.z;
+
+    float closestT = 1e18f;
+    int hitFace = -1;
+    for (int faceIndex = 0; faceIndex < (int)model.pickData.size(); faceIndex++) {
+        const auto& faceData = model.pickData[faceIndex];
+        for (int i = 0; i + 2 < (int)faceData.indices.size(); i += 3) {
+            // fetch the three vertex positions for this triangle from the flat XYZ array
+            int i0 = faceData.indices[i] * 3, i1 = faceData.indices[i + 1] * 3, i2 = faceData.indices[i + 2] * 3;
+            Vec3 v0 = { faceData.vertices[i0], faceData.vertices[i0 + 1], faceData.vertices[i0 + 2] };
+            Vec3 v1 = { faceData.vertices[i1], faceData.vertices[i1 + 1], faceData.vertices[i1 + 2] };
+            Vec3 v2 = { faceData.vertices[i2], faceData.vertices[i2 + 1], faceData.vertices[i2 + 2] };
+            float t = rayTriangleIntersect(ray, v0, v1, v2);
+            if (t > 0.0f && t < closestT) {
+                closestT = t;
+                hitFace = faceIndex;
+            }
+        }
+    }
+    return hitFace;
+}
+
+// redraws the selected face in solid white then yellow wireframe so it stands out from the scene
+static void drawSelectedFaceHighlight(const CadModel& model)
+{
+    if (model.selectedFace < 0 || model.selectedFace >= (int)model.meshes.size())
+        return;
+    Vector3 center = modelCenter(model);
+    Matrix centeredTransform = MatrixTranslate(-center.x, -center.y, -center.z);
+    rlDisableBackfaceCulling();
+    Material solidMaterial = LoadMaterialDefault();
+    solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = WHITE;
+    DrawMesh(model.meshes[model.selectedFace], solidMaterial, centeredTransform);
+    UnloadMaterial(solidMaterial);
+    rlEnableWireMode();
+    Material wireMaterial = LoadMaterialDefault();
+    wireMaterial.maps[MATERIAL_MAP_DIFFUSE].color = YELLOW;
+    DrawMesh(model.meshes[model.selectedFace], wireMaterial, centeredTransform);
+    UnloadMaterial(wireMaterial);
+    rlDisableWireMode();
+    rlEnableBackfaceCulling();
+}
+
+// redraws the distance-reference face (shift+right clicked) with a brightened tint and orange wireframe
+// so it is visually distinct from both the scene and the primary selected face
+static void drawDistFaceHighlight(const CadModel& model)
+{
+    Vector3 center = modelCenter(model);
+    Matrix centeredTransform = MatrixTranslate(-center.x, -center.y, -center.z);
+    rlDisableBackfaceCulling();
+    // draw the face brighter by blending its base color toward white (+80 per channel)
+    Color base = model.colors[model.distFace];
+    Color brightened = { (unsigned char)std::min(255, (int)base.r + 80), (unsigned char)std::min(255, (int)base.g + 80),
+        (unsigned char)std::min(255, (int)base.b + 80), 255 };
+    Material solidMaterial = LoadMaterialDefault();
+    solidMaterial.maps[MATERIAL_MAP_DIFFUSE].color = brightened;
+    DrawMesh(model.meshes[model.distFace], solidMaterial, centeredTransform);
+    UnloadMaterial(solidMaterial);
+    rlEnableBackfaceCulling();
+}
+
+// returns the average position of all front-face vertices in draw space (with centering already applied)
+// used to anchor axis/normal arrows at the visual center of the face
+static Vector3 computeFaceCentroid(const TessellatedFace& face, Vector3 center)
+{
+    // front vertices occupy the first half of the flat array (second half is the back-face duplicates)
+    int frontVertexCount = (int)face.vertices.size() / 6;
+    Vector3 sum = { 0, 0, 0 };
+    for (int i = 0; i < frontVertexCount; i++) {
+        int base = i * 3;
+        sum.x += face.vertices[base] - center.x;
+        sum.y += face.vertices[base + 1] - center.y;
+        sum.z += face.vertices[base + 2] - center.z;
+    }
+    if (frontVertexCount > 0) {
+        float inv = 1.0f / (float)frontVertexCount;
+        sum.x *= inv;
+        sum.y *= inv;
+        sum.z *= inv;
+    }
+    return sum;
+}
+
+// computes the axis-aligned bounding box of the face in draw space (with centering applied)
+static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center)
+{
+    BoundingBox bbox = { { 1e18f, 1e18f, 1e18f }, { -1e18f, -1e18f, -1e18f } };
+    int frontVertexCount = (int)face.vertices.size() / 6;
+    for (int i = 0; i < frontVertexCount; i++) {
+        int base = i * 3;
+        float x = face.vertices[base] - center.x;
+        float y = face.vertices[base + 1] - center.y;
+        float z = face.vertices[base + 2] - center.z;
+        bbox.min.x = std::min(bbox.min.x, x);
+        bbox.max.x = std::max(bbox.max.x, x);
+        bbox.min.y = std::min(bbox.min.y, y);
+        bbox.max.y = std::max(bbox.max.y, y);
+        bbox.min.z = std::min(bbox.min.z, z);
+        bbox.max.z = std::max(bbox.max.z, z);
+    }
+    return bbox;
+}
+
+// brute-force O(n*m) minimum vertex-to-vertex distance between two faces, approximates the true surface-to-surface distance,
+// accurate enough for CAD face vertex densities (hundreds at most per face), adjacent faces sharing an edge will return 0 (shared vertex)
+static float computeFaceMinDistance(const TessellatedFace& faceA, const TessellatedFace& faceB)
+{
+    float minDistSq = 1e18f;
+    int countA = (int)faceA.vertices.size() / 6; // front vertices only
+    int countB = (int)faceB.vertices.size() / 6;
+    for (int i = 0; i < countA; i++) {
+        int baseA = i * 3;
+        for (int j = 0; j < countB; j++) {
+            int baseB = j * 3;
+            float dx = faceA.vertices[baseA] - faceB.vertices[baseB];
+            float dy = faceA.vertices[baseA + 1] - faceB.vertices[baseB + 1];
+            float dz = faceA.vertices[baseA + 2] - faceB.vertices[baseB + 2];
+            float dSq = dx * dx + dy * dy + dz * dz;
+            if (dSq < minDistSq)
+                minDistSq = dSq;
+        }
+    }
+    return sqrtf(minDistSq);
+}
+
+// draws the whole model bounding box (centered at origin to match drawCadModel) in gold
+static void drawModelBbox(const CadModel& model)
+{
+    Vector3 center = modelCenter(model);
+    BoundingBox centeredBbox = { { model.bbox.min.x - center.x, model.bbox.min.y - center.y, model.bbox.min.z - center.z },
+        { model.bbox.max.x - center.x, model.bbox.max.y - center.y, model.bbox.max.z - center.z } };
+    DrawBoundingBox(centeredBbox, GOLD);
+}
+
+// draws the bounding box of the selected face in orange, for planes this will be a near-flat rectangle, for cylinders/tori a proper 3D box
+static void drawFaceBbox(const CadModel& model)
+{
+    if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
+        return;
+    Vector3 center = modelCenter(model);
+    DrawBoundingBox(computeFaceBBox(model.pickData[model.selectedFace], center), ORANGE);
+}
+
+// draws small yellow outward normal arrows per triangle of the selected face (front-face triangles only, strided to avoid clutter)
+// normalLength should be scaled to the model size, ex: diagonal * 0.03
+static void drawFaceNormals(const CadModel& model, float normalLength)
+{
+    if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
+        return;
+    Vector3 center = modelCenter(model);
+    const auto& faceData = model.pickData[model.selectedFace];
+    // tessGrid emits front vertices first then back vertices (same count), so front indices are all < frontVertexCount
+    // we only draw normals for front-face triangles to avoid double arrows pointing in opposite directions
+    int frontVertexCount = (int)faceData.vertices.size() / 3 / 2;
+    // skip every 3 triangles (6 indices * 3 = 18) to keep the display readable on dense meshes
+    for (int i = 0; i + 2 < (int)faceData.indices.size(); i += 18) {
+        if (faceData.indices[i] >= frontVertexCount || faceData.indices[i + 1] >= frontVertexCount || faceData.indices[i + 2] >= frontVertexCount)
+            continue;
+        int i0 = faceData.indices[i] * 3, i1 = faceData.indices[i + 1] * 3, i2 = faceData.indices[i + 2] * 3;
+        // triangle centroid in draw space (apply same centering as drawCadModel)
+        Vector3 triCenter = { (faceData.vertices[i0] + faceData.vertices[i1] + faceData.vertices[i2]) / 3.0f - center.x,
+            (faceData.vertices[i0 + 1] + faceData.vertices[i1 + 1] + faceData.vertices[i2 + 1]) / 3.0f - center.y,
+            (faceData.vertices[i0 + 2] + faceData.vertices[i1 + 2] + faceData.vertices[i2 + 2]) / 3.0f - center.z };
+        // average normal of the three vertices (analytical normals so all three are essentially identical, average is just for correctness)
+        Vector3 triNormal = { (faceData.normals[i0] + faceData.normals[i1] + faceData.normals[i2]) / 3.0f,
+            (faceData.normals[i0 + 1] + faceData.normals[i1 + 1] + faceData.normals[i2 + 1]) / 3.0f,
+            (faceData.normals[i0 + 2] + faceData.normals[i1 + 2] + faceData.normals[i2 + 2]) / 3.0f };
+        Vector3 arrowTip = { triCenter.x + triNormal.x * normalLength, triCenter.y + triNormal.y * normalLength, triCenter.z + triNormal.z * normalLength };
+        DrawLine3D(triCenter, arrowTip, YELLOW);
+    }
+}
+
+// draws a single large SKYBLUE arrow/line representing the analytical surface definition of the selected face:
+// plane -> normal arrow from face centroid, cylinder/torus -> axis line through the surface origin
+// drawn at 5x the triangle arrow length to visually distinguish it from the yellow per-triangle arrows
+static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
+{
+    if (model.selectedFace < 0 || model.selectedFace >= (int)model.faceSurfaces.size())
+        return;
+    Vector3 center = modelCenter(model);
+    const Surface& surface = model.faceSurfaces[model.selectedFace];
+
+    switch (surface.kind) {
+    case SurfaceKind::Plane: {
+        // one big normal arrow from the face centroid along zDir
+        Vector3 faceCentroid = computeFaceCentroid(model.pickData[model.selectedFace], center);
+        Vec3 normal = surface.axis.zDir.norm();
+        Vector3 tip = { faceCentroid.x + (float)normal.x * scale, faceCentroid.y + (float)normal.y * scale, faceCentroid.z + (float)normal.z * scale };
+        DrawLine3D(faceCentroid, tip, SKYBLUE);
+        break;
+    }
+    case SurfaceKind::Cylinder:
+    case SurfaceKind::Torus: {
+        // axis line extending in both directions from the surface origin (which is a point on the axis)
+        Vector3 axisOrigin = { (float)surface.axis.origin.x - center.x, (float)surface.axis.origin.y - center.y, (float)surface.axis.origin.z - center.z };
+        Vec3 axisDir = surface.axis.zDir.norm();
+        Vector3 axisStart = { axisOrigin.x - (float)axisDir.x * scale, axisOrigin.y - (float)axisDir.y * scale, axisOrigin.z - (float)axisDir.z * scale };
+        Vector3 axisEnd = { axisOrigin.x + (float)axisDir.x * scale, axisOrigin.y + (float)axisDir.y * scale, axisOrigin.z + (float)axisDir.z * scale };
+        DrawLine3D(axisStart, axisEnd, SKYBLUE);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+// draws the area-weighted average orientation of all faces as a SKYBLUE arrow from the model center (draw-space origin)
+// each face contributes its zDir (plane normal / cylinder+torus axis) weighted by its tessellated area
+static void drawModelAverageNormal(const CadModel& model, float scale)
+{
+    Vec3 weightedSum = { 0, 0, 0 };
+    for (int i = 0; i < (int)model.faceSurfaces.size(); i++) {
+        Vec3 faceAxis = model.faceSurfaces[i].axis.zDir.norm();
+        float weight = (i < (int)model.faceAreas.size()) ? model.faceAreas[i] : 1.0f;
+        weightedSum = weightedSum + faceAxis * weight;
+    }
+    Vec3 avgNormal = weightedSum.norm();
+    // model is drawn centered at origin, so the center of the model in draw space is always (0,0,0)
+    Vector3 origin3D = { 0, 0, 0 };
+    Vector3 tip = { (float)avgNormal.x * scale, (float)avgNormal.y * scale, (float)avgNormal.z * scale };
+    DrawLine3D(origin3D, tip, SKYBLUE);
 }
 
 #pragma region main
@@ -1220,6 +1530,14 @@ int main()
     camera.fovy = 45;
     camera.projection = CAMERA_PERSPECTIVE;
 
+    bool showNormals = false;
+    bool showBbox = false;
+
+    Vector3 modelBboxCenter = modelCenter(model);
+    float modelW = model.bbox.max.x - model.bbox.min.x;
+    float modelH = model.bbox.max.y - model.bbox.min.y;
+    float modelD = model.bbox.max.z - model.bbox.min.z;
+
     while (!WindowShouldClose()) {
         // left mouse drag -> orbit
         if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
@@ -1240,6 +1558,22 @@ int main()
         if (orbitRadius > diagonal * 10.f)
             orbitRadius = diagonal * 10.f;
 
+        if (IsMouseButtonPressed(MOUSE_BUTTON_RIGHT)) {
+            int hitFace = pickFace(model, GetMouseRay(GetMousePosition(), camera));
+            if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+                if (model.selectedFace > -1)
+                    model.distFace = (hitFace > -1 && hitFace != model.selectedFace) ? hitFace : -1;
+            } else {
+                model.selectedFace = hitFace;
+                model.distFace = -1;
+            }
+        }
+
+        if (IsKeyPressed(KEY_N))
+            showNormals = !showNormals;
+        if (IsKeyPressed(KEY_B))
+            showBbox = !showBbox;
+
         // convert spherical (yaw, pitch, orbitRadius) to Cartesian camera position (x y z)
         // ex: yaw=90deg, pitch=0 -> camera sits on the +X axis looking toward origin
         float yawRadians = DEG2RAD * yaw;
@@ -1251,12 +1585,81 @@ int main()
         ClearBackground({ 18, 18, 22, 255 });
         BeginMode3D(camera);
         drawCadModel(model);
+        drawSelectedFaceHighlight(model);
+        if (model.distFace > -1)
+            drawDistFaceHighlight(model);
+        if (showBbox) {
+            if (model.selectedFace > -1)
+                drawFaceBbox(model);
+            else
+                drawModelBbox(model);
+        }
+        if (showNormals) {
+            if (model.selectedFace > -1) {
+                drawFaceNormals(model, diagonal * 0.03f); // small yellow arrows per triangle
+                drawFaceAnalyticalAxis(model, diagonal * 0.15f); // big SKYBLUE axis/normal of the surface
+            } else {
+                drawModelAverageNormal(model, diagonal * 0.3f); // SKYBLUE arrow for dominant model orientation
+            }
+        }
         EndMode3D();
-        DrawText("RED = Cylinders", 20, 20, 16, RED);
-        DrawText("GREEN = Tori (fillets)", 20, 40, 16, GREEN);
-        DrawText("BLUE = Planes", 20, 60, 16, BLUE);
-        DrawText("GRAY = Other", 20, 80, 16, GRAY);
-        DrawText("Drag to orbit, scroll to zoom", 20, 110, 14, LIGHTGRAY);
+
+        // stats panel - running Y so adding lines never requires renumbering
+        int uiY = 20;
+        const int uiStep = 20;
+        DrawText("RED = Cylinders", 20, uiY, 16, RED);
+        uiY += uiStep;
+        DrawText("GREEN = Tori (fillets)", 20, uiY, 16, GREEN);
+        uiY += uiStep;
+        DrawText("BLUE = Planes", 20, uiY, 16, BLUE);
+        uiY += uiStep;
+        DrawText("DARKGRAY = Other", 20, uiY, 16, DARKGRAY);
+        uiY += uiStep + 6;
+
+        DrawText(TextFormat("Faces: %d | Triangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, LIGHTGRAY);
+        uiY += uiStep;
+        // model bbox dimensions and center in STEP space (center is where the model sits before the centering transform)
+        DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", modelW, modelH, modelD), 20, uiY, 16, LIGHTGRAY);
+        uiY += uiStep;
+        DrawText(TextFormat("Position: 0.00 0.00 0.00"), 20, uiY, 16, LIGHTGRAY);
+        uiY += uiStep + 4;
+
+        DrawText("Drag = orbit | Scroll = zoom", 20, uiY, 16, LIGHTGRAY);
+        uiY += uiStep;
+        DrawText("RClick = select | Shift+RClick = get distance", 20, uiY, 16, LIGHTGRAY);
+        uiY += uiStep;
+        DrawText("N = normals | B = bounding box", 20, uiY, 16, LIGHTGRAY);
+        uiY += uiStep;
+
+        if (model.selectedFace > -1) {
+            uiY += 6;
+            int faceIdx = model.selectedFace;
+            int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
+            DrawText(TextFormat("Face #%d [%s] | %d triangles | %.2f mm^2", faceIdx, surfaceKindName(model.pickData[faceIdx].kind), frontTris,
+                         model.faceAreas[faceIdx]),
+                20, uiY, 16, YELLOW);
+            uiY += uiStep;
+
+            // face bbox dimensions and center (in draw space = relative to model center = world coords when model at origin)
+            Vector3 center = modelCenter(model);
+            BoundingBox faceBbox = computeFaceBBox(model.pickData[faceIdx], center);
+            float fw = faceBbox.max.x - faceBbox.min.x;
+            float fh = faceBbox.max.y - faceBbox.min.y;
+            float fd = faceBbox.max.z - faceBbox.min.z;
+            float fcx = (faceBbox.min.x + faceBbox.max.x) * 0.5f;
+            float fcy = (faceBbox.min.y + faceBbox.max.y) * 0.5f;
+            float fcz = (faceBbox.min.z + faceBbox.max.z) * 0.5f;
+            DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", fw, fh, fd), 20, uiY, 16, YELLOW);
+            uiY += uiStep;
+            DrawText(TextFormat("Position: %.2f, %.2f, %.2f", fcx, fcy, fcz), 20, uiY, 16, YELLOW);
+            uiY += uiStep;
+
+            if (model.distFace > -1) {
+                float dist = computeFaceMinDistance(model.pickData[model.selectedFace], model.pickData[model.distFace]);
+                DrawText(TextFormat("Distance to #%d: %.4f mm", model.distFace, dist), 20, uiY, 16, ORANGE);
+            }
+        }
+
         EndDrawing();
     }
     CloseWindow();

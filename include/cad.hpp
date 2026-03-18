@@ -85,5 +85,11 @@ struct CadModel {
     std::vector<Mesh> meshes;
     std::vector<Color> colors; // one per mesh (index wise), color-coded by surface type
     BoundingBox bbox;
+    std::vector<TessellatedFace> pickData; // CPU copy kept after GPU upload, for mouse ray picking and analysis
+    std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
+    std::vector<float> faceAreas;
+    int totalTriangleCount = 0;
+    int selectedFace = -1;
+    int distFace = -1;
     ~CadModel();
 };
