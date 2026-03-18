@@ -223,7 +223,11 @@ Vec3 surfaceNormalAt(const Surface& surface, Vec3 pos)
 
 #pragma region curve
 // sampler: a CIRCLE arc from startPt to endPt (or full revolution if isClosedLoop)
-static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isClosedLoop, const StepMap& map, int segs)
+// sameSense: effective arc direction = EDGE_CURVE same_sense XOR ORIENTED_EDGE edgeReversed
+// true = CCW sweep (angleEnd > angleStart), false = CW sweep (angleEnd < angleStart, short arc the other way)
+// reversing an edge traversal also reverses which arc direction is the correct short arc, hence the XOR
+// ex: same_sense=.T., edgeReversed=true -> effective false -> CW sweep takes the 75 deg arc, not the 285 deg one
+static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isClosedLoop, const StepMap& map, int segs, bool sameSense = true)
 {
     auto entityIt = map.find(id);
     if (entityIt == map.end())
@@ -249,21 +253,32 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
         // full revolution: 0 -> 2pi, sample 'segs' segments
         angleStart = 0;
         angleEnd = 2 * M_PI;
-    } else {
+    } else if (sameSense) {
+        // CCW sweep: enforce angleEnd > angleStart
+        // ex: start=2.9rad, end=-2.9rad (same as +3.38) -> angleEnd becomes -2.9+2pi=3.38
         angleStart = angleOf(startPt);
         angleEnd = angleOf(endPt);
-        // enforce CCW sweep: if end <= start (due to atan2 wrap), add 2pi until it's past start
-        // ex: start=2.9rad, end=-2.9rad (same as +3.38) -> angleEnd becomes -2.9+2pi=3.38
         while (angleEnd <= angleStart)
             angleEnd += 2 * M_PI;
         // clamp to at most one full revolution (guard against floating-point overshoot)
         if (angleEnd - angleStart > 2 * M_PI + 1e-6)
             angleEnd = angleStart + 2 * M_PI;
+    } else {
+        // CW sweep: enforce angleEnd < angleStart (short arc in decreasing-angle direction)
+        // ex: start=3.14rad, end=-1.83rad -> CW sweep=-1.31 (75 deg correct short arc)
+        //     without this: CCW enforcement would give sweep=4.97 (285 deg, the wrong long arc)
+        angleStart = angleOf(startPt);
+        angleEnd = angleOf(endPt);
+        while (angleEnd >= angleStart)
+            angleEnd -= 2 * M_PI;
+        // clamp to at most one full revolution
+        if (angleStart - angleEnd > 2 * M_PI + 1e-6)
+            angleEnd = angleStart - 2 * M_PI;
     }
     // scale segment count proportionally to the arc fraction of a full circle
     // ex: segs=48, quarter arc (pi/2 out of 2pi) -> numSegments = max(2, 48*0.25) = 12 segments
     // always emit at least 2 points (start + end) for degenerate near-zero arcs
-    int numSegments = isClosedLoop ? segs : std::max(2, (int)(segs * (angleEnd - angleStart) / (2 * M_PI)));
+    int numSegments = isClosedLoop ? segs : std::max(2, (int)(segs * std::abs(angleEnd - angleStart) / (2 * M_PI)));
     std::vector<Vec3> points;
     points.reserve(numSegments + 1);
     for (int i = 0; i <= numSegments; i++) {
@@ -431,9 +446,13 @@ static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
             continue;
         // EDGE_CURVE params: (name, start_vertex_ref, end_vertex_ref, curve_ref, same_sense)
         // ex: "('', #130, #131, #132, .T.)" -> goes from vtx #130 to vtx #131 along curve #132
+        // effective sameSense = rawSameSense XOR edgeReversed: reversing the edge traversal also
+        // reverses the arc direction, flipping which arc (short vs long) is the geometrically correct one
         auto edgeCurveParams = splitTopLevel(edgeCurveIt->second.params);
         if (edgeCurveParams.size() < 4)
             continue;
+        bool rawSameSense = !(edgeCurveParams.size() >= 5 && trimWS(edgeCurveParams[4]) == ".F.");
+        bool sameSense = rawSameSense != edgeReversed; // XOR
 
         int startVertexId = stepRef(edgeCurveParams[1]), endVertexId = stepRef(edgeCurveParams[2]);
         // if start and end vertex entity are the same ref, this edge is a closed circle (full revolution)
@@ -462,7 +481,7 @@ static BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
         auto curveIt = map.find(curveId);
         if (curveIt != map.end()) {
             if (curveIt->second.type == "CIRCLE")
-                edgeSamples = sampleCircle(curveId, vertexStart, vertexEnd, fullCircle, map, arcSegs);
+                edgeSamples = sampleCircle(curveId, vertexStart, vertexEnd, fullCircle, map, arcSegs, sameSense);
             else if (curveIt->second.type == "LINE")
                 edgeSamples = { vertexStart, vertexEnd };
             else if (curveIt->second.type == "B_SPLINE_CURVE_WITH_KNOTS")
