@@ -1924,28 +1924,38 @@ static void drawUI(const CadModel& model)
     DrawText("DARKGRAY = Other", 20, uiY, 16, DARKGRAY);
     uiY += uiStep + 6;
 
-    DrawText(TextFormat("Faces: %d | Triangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
+    DrawText(TextFormat("Faces: %d\nTriangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep * 2; // because of the \n, applied down there too
 
     // model bbox dimensions and center recomputed each frame to reflect per-face offsets
     BoundingBox liveBbox = computeLiveModelBBox(model);
     Vector3 mCenter = modelCenter(model);
-    DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", liveBbox.max.x - liveBbox.min.x, liveBbox.max.y - liveBbox.min.y,
+    DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", liveBbox.max.x - liveBbox.min.x, liveBbox.max.y - liveBbox.min.y,
                  liveBbox.max.z - liveBbox.min.z),
         20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep;
+    uiY += uiStep * 3;
     DrawText(TextFormat("Position: %.2f %.2f %.2f", (liveBbox.min.x + liveBbox.max.x) * 0.5f - mCenter.x, (liveBbox.min.y + liveBbox.max.y) * 0.5f - mCenter.y,
                  (liveBbox.min.z + liveBbox.max.z) * 0.5f - mCenter.z),
         20, uiY, 16, LIGHTGRAY);
-    uiY += uiStep + 4;
+    uiY += uiStep;
 
-    DrawText("Drag = orbit | Scroll = zoom", 20, uiY, 16, LIGHTGRAY);
+    DrawText("Drag = orbit", 20, uiY, 16, LIGHTGRAY);
     uiY += uiStep;
-    DrawText("RClick = select | Shift+RClick = get distance", 20, uiY, 16, LIGHTGRAY);
+    DrawText("Scroll = zoom", 20, uiY, 16, LIGHTGRAY);
     uiY += uiStep;
-    DrawText("N = normals | B = bounding box", 20, uiY, 16, LIGHTGRAY);
+    DrawText("N = normals", 20, uiY, 16, LIGHTGRAY);
     uiY += uiStep;
-    DrawText("Arrows/page keys = translate face | Ctrl+U/Y = undo/redo", 20, uiY, 16, LIGHTGRAY);
+    DrawText("B = bounding box", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("RClick = select face", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("On selection:", 20, uiY, 16, YELLOW);
+    uiY += uiStep;
+    DrawText("Shift+RClick = get distance", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("Arrows/page keys = translate", 20, uiY, 16, LIGHTGRAY);
+    uiY += uiStep;
+    DrawText("Ctrl+U/Y = undo/redo", 20, uiY, 16, LIGHTGRAY);
     uiY += uiStep;
 
     if (model.selectedFace < 0)
@@ -1954,18 +1964,19 @@ static void drawUI(const CadModel& model)
     uiY += 6;
     int faceIdx = model.selectedFace;
     int frontTris = (int)model.pickData[faceIdx].indices.size() / 6;
-    DrawText(TextFormat("Face #%d [%s] | %d triangles | %.2f mm^2", faceIdx, nameForKind(model.pickData[faceIdx].kind), frontTris, model.faceAreas[faceIdx]),
+    DrawText(
+        TextFormat("Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceIdx, nameForKind(model.pickData[faceIdx].kind), frontTris, model.faceAreas[faceIdx]),
         20, uiY, 16, YELLOW);
-    uiY += uiStep;
+    uiY += uiStep * 3;
 
     // face bbox dimensions and center (in draw space = relative to model center = world coords when model at origin)
     // offset applied so stats match the visual position of the face after push/pull
     Vector3 center = modelCenter(model);
     BoundingBox faceBbox = computeFaceBBox(model.pickData[faceIdx], center, model.faceOffsets[faceIdx]);
-    DrawText(TextFormat("Width: %.2f | Height: %.2f | Depth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
+    DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
                  faceBbox.max.z - faceBbox.min.z),
         20, uiY, 16, YELLOW);
-    uiY += uiStep;
+    uiY += uiStep * 3;
     DrawText(TextFormat("Position: %.2f, %.2f, %.2f", (faceBbox.min.x + faceBbox.max.x) * 0.5f, (faceBbox.min.y + faceBbox.max.y) * 0.5f,
                  (faceBbox.min.z + faceBbox.max.z) * 0.5f),
         20, uiY, 16, YELLOW);
