@@ -1230,6 +1230,23 @@ CadModel loadStep(const std::string& path, int arcSegs = 48)
         model.faceSurfaces.push_back(faceSurface);
         model.faceAreas.push_back(computeFaceArea(tessellatedFace));
         model.faceOffsets.push_back({ 0.0f, 0.0f, 0.0f });
+        // record height range for cylinders so healing can retessellate with updated bounds
+        // project all front-face vertices onto the cylinder axis to recover [heightMin, heightMax]
+        CylinderHeightRange chr;
+        if (faceSurface.kind == SurfaceKind::Cylinder) {
+            Vec3 cylOrigin = faceSurface.axis.origin, cylZ = faceSurface.axis.zDir.norm();
+            chr.heightMin = 1e18;
+            chr.heightMax = -1e18;
+            int frontVertexCount = (int)tessellatedFace.vertices.size() / 6;
+            for (int vi = 0; vi < frontVertexCount; vi++) {
+                int base = vi * 3;
+                Vec3 pt = { tessellatedFace.vertices[base], tessellatedFace.vertices[base + 1], tessellatedFace.vertices[base + 2] };
+                double h = (pt - cylOrigin).dot(cylZ);
+                chr.heightMin = std::min(chr.heightMin, h);
+                chr.heightMax = std::max(chr.heightMax, h);
+            }
+        }
+        model.cylHeightRanges.push_back(chr);
         model.totalTriangleCount += (int)tessellatedFace.indices.size() / 6; // front triangles only
     }
     return model;
@@ -1588,6 +1605,166 @@ static void drawModelAverageNormal(const CadModel& model, float scale)
     DrawLine3D(origin3D, tip, SKYBLUE);
 }
 
+#pragma region geometry healing
+// retessellates the GPU mesh of a cylinder face with updated [heightMin, heightMax] and re-uploads it
+// the CPU pickData is also replaced so ray picking and stats remain accurate
+static void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double newHeightMax)
+{
+    const Surface& surf = model.faceSurfaces[cylIdx];
+    Vec3 origin = surf.axis.origin, Z = surf.axis.zDir.norm(), X = surf.axis.xDir.norm();
+    Vec3 Y = Z.cross(X).norm();
+    double radius = surf.majorRadius;
+
+    // reconstruct the angle range from the existing pickData (we cannot re-run sampleLoop without the StepMap)
+    // project all front-face vertices onto the XY plane of the cylinder and recover the angle sweep
+    const TessellatedFace& oldFace = model.pickData[cylIdx];
+    int frontVertexCount = (int)oldFace.vertices.size() / 6;
+    double rawAngleMin = 1e18, rawAngleMax = -1e18;
+    for (int vi = 0; vi < frontVertexCount; vi++) {
+        int base = vi * 3;
+        Vec3 pt = { oldFace.vertices[base], oldFace.vertices[base + 1], oldFace.vertices[base + 2] };
+        Vec3 delta = pt - origin;
+        double angle = std::atan2(delta.dot(Y), delta.dot(X));
+        rawAngleMin = std::min(rawAngleMin, angle);
+        rawAngleMax = std::max(rawAngleMax, angle);
+    }
+    double angleMin = rawAngleMin, angleMax = rawAngleMax;
+    // same full-revolution detection as tessCylinder: span > 1.9*pi -> treat as full circle
+    if (rawAngleMax - rawAngleMin > 1.9 * M_PI) {
+        angleMin = 0;
+        angleMax = 2 * M_PI;
+    }
+    // reconstruct uCount from the original tessellation: vertex count per row = uCount+1, total front rows = 2 (vSteps=1)
+    // frontVertexCount = (uCount+1) * (1+1), so uCount = frontVertexCount/2 - 1
+    int uCount = std::max(2, frontVertexCount / 2 - 1);
+
+    auto positionFn = [&](double u, double v) -> Vec3 {
+        Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
+        return origin + radialDir * radius + Z * v;
+    };
+    auto normalFn = [&](double u, double v) -> Vec3 {
+        (void)v;
+        return (X * std::cos(u) + Y * std::sin(u));
+    };
+    TessellatedFace newFace = tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, newHeightMin, newHeightMax, 1);
+
+    // unload the old GPU mesh and upload the new one
+    UnloadMesh(model.meshes[cylIdx]);
+    model.meshes[cylIdx] = uploadMesh(newFace);
+    model.pickData[cylIdx] = newFace;
+    model.faceAreas[cylIdx] = computeFaceArea(newFace);
+    model.cylHeightRanges[cylIdx] = { newHeightMin, newHeightMax };
+}
+
+// checks if two faces share at least one vertex within eps (front-face vertices only)
+// used to confirm a plane and a cylinder are topologically connected at a cap, planeOff and cylOff are the current draw-space offsets of each face
+static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.05f)
+{
+    int planeCount = (int)planeData.vertices.size() / 6;
+    int cylCount = (int)cylData.vertices.size() / 6;
+    float epsSq = eps * eps;
+    for (int i = 0; i < planeCount; i++) {
+        int baseP = i * 3;
+        float px = planeData.vertices[baseP] + planeOff.x;
+        float py = planeData.vertices[baseP + 1] + planeOff.y;
+        float pz = planeData.vertices[baseP + 2] + planeOff.z;
+        for (int j = 0; j < cylCount; j++) {
+            int baseC = j * 3;
+            float cx = cylData.vertices[baseC] + cylOff.x;
+            float cy = cylData.vertices[baseC + 1] + cylOff.y;
+            float cz = cylData.vertices[baseC + 2] + cylOff.z;
+            float dx = px - cx, dy = py - cy, dz = pz - cz;
+            if (dx * dx + dy * dy + dz * dz < epsSq)
+                return true;
+        }
+    }
+    return false;
+}
+
+// builds the heal cache for the selected plane face at gesture start (rising edge of the translation)
+// scans all cylinders once: checks axis alignment and vertex adjacency at the current (initial) position,
+// records which cap each connected cylinder should extend so per-frame updates need no proximity work at all
+static std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceIdx)
+{
+    std::vector<CylinderHealEntry> cache;
+    if (planeFaceIdx < 0 || planeFaceIdx >= (int)model.faceSurfaces.size())
+        return cache;
+    const Surface& planeSurf = model.faceSurfaces[planeFaceIdx];
+    if (planeSurf.kind != SurfaceKind::Plane)
+        return cache;
+
+    Vec3 planeNormal = planeSurf.axis.zDir.norm();
+    const Vector3& planeOff = model.faceOffsets[planeFaceIdx];
+
+    // compute plane centroid in STEP space once (no offset, raw vertex data)
+    Vec3 planeCent = { 0, 0, 0 };
+    int planeCount = (int)model.pickData[planeFaceIdx].vertices.size() / 6;
+    for (int vi = 0; vi < planeCount; vi++) {
+        int base = vi * 3;
+        planeCent.x += model.pickData[planeFaceIdx].vertices[base];
+        planeCent.y += model.pickData[planeFaceIdx].vertices[base + 1];
+        planeCent.z += model.pickData[planeFaceIdx].vertices[base + 2];
+    }
+    if (planeCount > 0) {
+        double inv = 1.0 / planeCount;
+        planeCent = { planeCent.x * inv, planeCent.y * inv, planeCent.z * inv };
+    }
+
+    for (int ci = 0; ci < (int)model.faceSurfaces.size(); ci++) {
+        if (model.faceSurfaces[ci].kind != SurfaceKind::Cylinder)
+            continue;
+        const Surface& cylSurf = model.faceSurfaces[ci];
+        Vec3 cylAxis = cylSurf.axis.zDir.norm();
+
+        // axis alignment, plane normal and cylinder axis must be parallel (same or opposite direction)
+        double dotVal = planeNormal.dot(cylAxis);
+        if (std::abs(dotVal) < 0.99)
+            continue;
+
+        // adjacency check done here once at gesture start, plane is still at its initial position
+        if (!facesShareVertex(model.pickData[planeFaceIdx], planeOff, model.pickData[ci], model.faceOffsets[ci]))
+            continue;
+
+        // determine cap by projecting raw plane centroid onto the cylinder axis, compare to height midpoint
+        Vec3 toCent = { planeCent.x - cylSurf.axis.origin.x, planeCent.y - cylSurf.axis.origin.y, planeCent.z - cylSurf.axis.origin.z };
+        double planeProjH = toCent.dot(cylAxis);
+        const CylinderHeightRange& chr = model.cylHeightRanges[ci];
+        bool isMaxCap = (planeProjH >= (chr.heightMin + chr.heightMax) * 0.5);
+
+        cache.push_back({ ci, isMaxCap, dotVal });
+    }
+    return cache;
+}
+
+// applies the cached heal entries for one frame: extends each recorded cylinder cap by the axial component of delta
+// no proximity scan because the cache is stable for the entire gesture duration
+// when the plane crosses through the opposite cap (height range would invert), min/max are swapped and isMaxCap
+// is flipped so the cylinder mirrors correctly and subsequent frames continue healing from the new orientation
+static void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cache, Vec3 planeNormal, Vector3 delta)
+{
+    double axialDelta = planeNormal.x * delta.x + planeNormal.y * delta.y + planeNormal.z * delta.z;
+    if (std::abs(axialDelta) < 1e-8)
+        return;
+    for (auto& entry : cache) {
+        double signedDelta = axialDelta * entry.axisDotNormal;
+        CylinderHeightRange& chr = model.cylHeightRanges[entry.cylFaceIdx];
+        double newHeightMin = chr.heightMin, newHeightMax = chr.heightMax;
+        if (entry.isMaxCap)
+            newHeightMax = chr.heightMax + signedDelta;
+        else
+            newHeightMin = chr.heightMin + signedDelta;
+        // when the moving cap crosses through the fixed cap the range inverts:
+        // swap min and max so the cylinder reflects through its fixed cap, and flip isMaxCap so the
+        // same plane direction continues shrinking/growing the correct (now-opposite) cap next frame
+        // ex: plane pushes top cap down past the bottom -> range [0,5] becomes [5,0] -> swap to [0,5] reflected, flip cap
+        if (newHeightMax < newHeightMin) {
+            std::swap(newHeightMin, newHeightMax);
+            entry.isMaxCap = !entry.isMaxCap;
+        }
+        retessCylinderFace(model, entry.cylFaceIdx, newHeightMin, newHeightMax);
+    }
+}
+
 #pragma region main
 static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float& pitch, float& orbitRadius, bool& showNormals, bool& showBbox, float diagonal)
 {
@@ -1628,14 +1805,13 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
 
     // push/pull: move selected face along its surface's own axes
     // UP/DOWN = zDir (normal for planes, axis for cylinders/tori), LEFT/RIGHT = xDir (in-plane tangent), PgUp/PgDn = yDir (zDir×xDir)
-    // step size = 0.5% of model diagonal per frame, Shift multiplies by 10
     // wasTranslating detects the rising edge of a translation gesture so one continuous hold = one undo entry
     static bool wasTranslating = false;
+    static int cachedHealFace = -1; // selectedFace at the time the heal cache was built
+    static std::vector<CylinderHealEntry> healCache; // built once per gesture, reused every frame until key release
     bool translating = false;
     if (model.selectedFace > -1) {
         float step = diagonal * 0.005f;
-        if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT))
-            step *= 10.0f;
         const Surface& surf = model.faceSurfaces[model.selectedFace];
         Vec3 zDir = surf.axis.zDir.norm();
         Vec3 xDir = surf.axis.xDir.norm();
@@ -1646,40 +1822,54 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         if (translating && !wasTranslating) {
             model.undoStack.push_back({ model.selectedFace, off });
             model.redoStack.clear();
+            // build the heal cache once at the start of each gesture while the plane is still touching the cylinder
+            // subsequent frames reuse it so no proximity scan happens during translation
+            if (cachedHealFace != model.selectedFace) {
+                healCache = buildCylinderHealCache(model, model.selectedFace);
+                cachedHealFace = model.selectedFace;
+            }
+        }
+        // invalidate cache if the selected face changed between gestures
+        if (cachedHealFace != model.selectedFace) {
+            healCache.clear();
+            cachedHealFace = -1;
         }
         wasTranslating = translating;
+        Vec3 planeNormal = surf.axis.zDir.norm();
         if (IsKeyDown(KEY_UP)) {
-            off.x += (float)zDir.x * step;
-            off.y += (float)zDir.y * step;
-            off.z += (float)zDir.z * step;
+            Vector3 delta = { (float)zDir.x * step, (float)zDir.y * step, (float)zDir.z * step };
+            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_DOWN)) {
-            off.x -= (float)zDir.x * step;
-            off.y -= (float)zDir.y * step;
-            off.z -= (float)zDir.z * step;
+            Vector3 delta = { -(float)zDir.x * step, -(float)zDir.y * step, -(float)zDir.z * step };
+            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_RIGHT)) {
-            off.x += (float)xDir.x * step;
-            off.y += (float)xDir.y * step;
-            off.z += (float)xDir.z * step;
+            Vector3 delta = { (float)xDir.x * step, (float)xDir.y * step, (float)xDir.z * step };
+            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_LEFT)) {
-            off.x -= (float)xDir.x * step;
-            off.y -= (float)xDir.y * step;
-            off.z -= (float)xDir.z * step;
+            Vector3 delta = { -(float)xDir.x * step, -(float)xDir.y * step, -(float)xDir.z * step };
+            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_PAGE_UP)) {
-            off.x += (float)yDir.x * step;
-            off.y += (float)yDir.y * step;
-            off.z += (float)yDir.z * step;
+            Vector3 delta = { (float)yDir.x * step, (float)yDir.y * step, (float)yDir.z * step };
+            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
         if (IsKeyDown(KEY_PAGE_DOWN)) {
-            off.x -= (float)yDir.x * step;
-            off.y -= (float)yDir.y * step;
-            off.z -= (float)yDir.z * step;
+            Vector3 delta = { -(float)yDir.x * step, -(float)yDir.y * step, -(float)yDir.z * step };
+            off.x += delta.x; off.y += delta.y; off.z += delta.z;
+            applyCylinderHealCache(model, healCache, planeNormal, delta);
         }
     } else {
         wasTranslating = false;
+        healCache.clear();
+        cachedHealFace = -1;
     }
 
     // (ctrl+z is swallowed by the Win32 message loop as ASCII SUB before Raylib sees the key event XDD)

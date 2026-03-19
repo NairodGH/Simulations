@@ -86,6 +86,20 @@ struct UndoEntry {
     Vector3 offsetBefore;
 };
 
+// mutable height extent of a cylinder face along its axis, used for geometry healing when a connected cap plane is translated
+// stored separately so the healing pass can retessellate the cylinder with the updated range without re-parsing STEP
+// for non-cylinder faces both values are 0 and the struct is never read
+struct CylinderHeightRange {
+    double heightMin = 0, heightMax = 0;
+};
+
+// one entry in the per-gesture heal cache, which cylinder to extend and which cap to move
+struct CylinderHealEntry {
+    int cylFaceIdx;
+    bool isMaxCap; // true = move heightMax, false = move heightMin
+    double axisDotNormal; // dot(cylAxis, planeNormal) = about 1, preserves sign for signedDelta each frame
+};
+
 // final GPU model
 struct CadModel {
     std::vector<Mesh> meshes;
@@ -95,6 +109,7 @@ struct CadModel {
     std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
     std::vector<float> faceAreas;
     std::vector<Vector3> faceOffsets; // per-face translation in draw space, applied on top of the centering transform at draw/query time
+    std::vector<CylinderHeightRange> cylHeightRanges; // per-face cylinder axis height range, kept mutable for geometry healing; non-cylinders are zeroed
     int totalTriangleCount = 0;
     int selectedFace = -1;
     int distFace = -1;
