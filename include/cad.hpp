@@ -80,17 +80,24 @@ struct StepEntity {
 };
 using StepMap = std::unordered_map<int, StepEntity>;
 
-// one entry on the undo/redo stack
-struct UndoEntry {
-    int faceIndex; // which face moved
-    Vector3 offsetBefore; // what its offset was before the move began
-};
-
 // mutable height extent of a cylinder face along its axis, used for geometry healing when a connected cap plane is translated,
 // stored separately so the healing pass can retessellate the cylinder with the updated range without re-parsing STEP
 // for non-cylinder faces both values are 0 and the struct is never read
 struct CylinderHeightRange {
     double heightMin = 0, heightMax = 0;
+};
+
+// snapshot of one healed cylinder's height range at the moment the undo entry was captured
+struct CylinderHeightSnapshot {
+    int cylFaceIdx;
+    CylinderHeightRange rangeBefore;
+};
+
+// one entry on the undo/redo stack
+struct UndoEntry {
+    int faceIndex; // which face moved
+    Vector3 offsetBefore; // what its offset was before the move began
+    std::vector<CylinderHeightSnapshot> cylSnapshots; // height ranges of every cylinder healed during this gesture, empty when no heal occurred
 };
 
 // one entry in the per-gesture heal cache, which cylinder to extend and which cap to move

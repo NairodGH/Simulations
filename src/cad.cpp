@@ -1792,13 +1792,20 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         translating
             = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
         if (translating && !wasTranslating) {
-            model.undoStack.push_back({ model.selectedFace, off });
-            model.redoStack.clear();
             // always rebuild at every gesture rising edge so connectivity is re-evaluated at the plane's current
             // position, a stale cache from a prior gesture must never carry over because the plane may have
             // been moved off-axis (disconnected from the cylinder) between gestures
             healCache = buildCylinderHealCache(model, model.selectedFace);
             cachedHealFace = model.selectedFace;
+            // snapshot the pre-gesture cylinder height ranges for every cylinder this gesture will heal so
+            // undo/redo can retessellate them back to the correct extent, not just the plane offset
+            UndoEntry entry;
+            entry.faceIndex = model.selectedFace;
+            entry.offsetBefore = off;
+            for (const auto& healEntry : healCache)
+                entry.cylSnapshots.push_back({ healEntry.cylFaceIdx, model.cylHeightRanges[healEntry.cylFaceIdx] });
+            model.undoStack.push_back(std::move(entry));
+            model.redoStack.clear();
         }
         // invalidate cache if the selected face changed between gestures
         if (cachedHealFace != model.selectedFace) {
@@ -1861,8 +1868,18 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         if (!model.undoStack.empty()) {
             UndoEntry entry = model.undoStack.back();
             model.undoStack.pop_back();
-            model.redoStack.push_back({ entry.faceIndex, model.faceOffsets[entry.faceIndex] });
+            // capture current cylinder height ranges before overwriting them so redo can restore forward state
+            UndoEntry redoEntry;
+            redoEntry.faceIndex = entry.faceIndex;
+            redoEntry.offsetBefore = model.faceOffsets[entry.faceIndex];
+            for (const auto& snap : entry.cylSnapshots)
+                redoEntry.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
+            model.redoStack.push_back(std::move(redoEntry));
             model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
+            for (const auto& snap : entry.cylSnapshots) {
+                model.cylHeightRanges[snap.cylFaceIdx] = snap.rangeBefore;
+                retessCylinderFace(model, snap.cylFaceIdx, snap.rangeBefore.heightMin, snap.rangeBefore.heightMax);
+            }
             model.selectedFace = entry.faceIndex;
         }
     }
@@ -1870,8 +1887,18 @@ static void handleControls(CadModel& model, Camera3D& camera, float& yaw, float&
         if (!model.redoStack.empty()) {
             UndoEntry entry = model.redoStack.back();
             model.redoStack.pop_back();
-            model.undoStack.push_back({ entry.faceIndex, model.faceOffsets[entry.faceIndex] });
+            // capture current cylinder height ranges before overwriting them so undo can restore backward state
+            UndoEntry undoEntry;
+            undoEntry.faceIndex = entry.faceIndex;
+            undoEntry.offsetBefore = model.faceOffsets[entry.faceIndex];
+            for (const auto& snap : entry.cylSnapshots)
+                undoEntry.cylSnapshots.push_back({ snap.cylFaceIdx, model.cylHeightRanges[snap.cylFaceIdx] });
+            model.undoStack.push_back(std::move(undoEntry));
             model.faceOffsets[entry.faceIndex] = entry.offsetBefore;
+            for (const auto& snap : entry.cylSnapshots) {
+                model.cylHeightRanges[snap.cylFaceIdx] = snap.rangeBefore;
+                retessCylinderFace(model, snap.cylFaceIdx, snap.rangeBefore.heightMin, snap.rangeBefore.heightMax);
+            }
             model.selectedFace = entry.faceIndex;
         }
     }
