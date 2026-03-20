@@ -128,3 +128,31 @@ struct CadModel {
     int distFace = -1;
     ~CadModel();
 };
+
+// parser utils
+std::vector<std::string> splitTopLevel(const std::string& input);
+std::string trimWS(const std::string& input);
+std::string unwrap(const std::string& input);
+int stepRef(const std::string& input);
+double dbl(const std::string& input);
+
+// parser.cpp: STEP file parsing, entity resolution, curve sampling, boundary loop resolution
+StepMap parseStepFile(const std::string& path);
+Vec3 resolvePoint(int id, const StepMap& map);
+AxisPlacement resolveAxis(int id, const StepMap& map);
+Surface resolveSurface(int id, const StepMap& map);
+BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs);
+
+// tessellator.cpp: UV grid, face tessellation, GPU upload, geometry healing
+TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v)> positionFn, std::function<Vec3(double u, double v)> normalFn, double u0,
+    double u1, int uSteps, double v0, double v1, int vSteps);
+TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr);
+float computeFaceArea(const TessellatedFace& face);
+Mesh uploadMesh(const TessellatedFace& tessellatedFace);
+void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double newHeightMax);
+std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceIdx);
+void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cache, Vec3 planeNormal, Vector3 delta);
+
+// cad.cpp: model loading and drawing
+CadModel loadStep(const std::string& path, int arcSegs = 48);
+void drawCadModel(const CadModel& model);

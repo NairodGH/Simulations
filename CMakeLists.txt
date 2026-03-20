@@ -36,7 +36,8 @@ set(LIBS raylib Eigen3::Eigen)
 set(TARGETS toolpath kinematic soup cad ppi)
 
 foreach(T IN LISTS TARGETS)
-    add_executable(${T} ${T}/${T}.cpp)
+    file(GLOB SRC ${T}/*.cpp)
+    add_executable(${T} ${SRC})
     set_target_properties(${T} PROPERTIES EXCLUDE_FROM_ALL TRUE)
     # target's own folder for its hpp, root for main.hpp
     target_include_directories(${T} PRIVATE ${T} ${CMAKE_SOURCE_DIR})
