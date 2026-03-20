@@ -1,4 +1,3 @@
-#pragma once
 #include "main.hpp"
 
 // farthest distance the sonar can detect anything, edge of the green circle on screen

@@ -1994,8 +1994,8 @@ int main()
     InitWindow(1280, 720, "CAD");
     SetTargetFPS(60);
 
-    // executable either at root or in build/Release but assets is always at root
-    CadModel model = loadStep(std::filesystem::exists("assets") ? "assets/screw.step" : "../../assets/screw.step");
+    // executable either at root or in build/Release idk xd
+    CadModel model = loadStep(std::filesystem::exists("cad/screw.step") ? "cad/screw.step" : "../../cad/screw.step");
 
     Vector3 modelSize = { model.bbox.max.x - model.bbox.min.x, model.bbox.max.y - model.bbox.min.y, model.bbox.max.z - model.bbox.min.z };
     // diagonal of the bounding box, aka "diameter" from one corner to the opposite,

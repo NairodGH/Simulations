@@ -36,15 +36,16 @@ set(LIBS raylib Eigen3::Eigen)
 set(TARGETS toolpath kinematic soup cad ppi)
 
 foreach(T IN LISTS TARGETS)
-    add_executable(${T} src/${T}.cpp)
+    add_executable(${T} ${T}/${T}.cpp)
     set_target_properties(${T} PROPERTIES EXCLUDE_FROM_ALL TRUE)
-    target_include_directories(${T} PRIVATE include)
+    # target's own folder for its hpp, root for main.hpp
+    target_include_directories(${T} PRIVATE ${T} ${CMAKE_SOURCE_DIR})
     target_link_libraries(${T} PRIVATE ${LIBS})
 endforeach()
 
 # Share a single PCH compilation across all targets
 list(GET TARGETS 0 FIRST_TARGET)
-target_precompile_headers(${FIRST_TARGET} PRIVATE include/main.hpp)
+target_precompile_headers(${FIRST_TARGET} PRIVATE ${CMAKE_SOURCE_DIR}/main.hpp)
 foreach(T IN LISTS TARGETS)
     if(NOT T STREQUAL FIRST_TARGET)
         target_precompile_headers(${T} REUSE_FROM ${FIRST_TARGET})

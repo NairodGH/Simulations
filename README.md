@@ -23,7 +23,7 @@ Available targets:
 
 <p align="center">
     <a href="https://en.wiktionary.org/wiki/toolpath">
-        <img src="assets/toolpath.gif">
+        <img src="toolpath/toolpath.gif">
     </a>
 </p>
 
@@ -33,7 +33,7 @@ Available targets:
 
 <p align="center">
     <a href="https://en.wikipedia.org/wiki/Kinematics">
-        <img src="assets/kinematic.gif">
+        <img src="kinematic/kinematic.gif">
     </a>
 </p>
 
@@ -44,7 +44,7 @@ Only axis 0 (base) can be changed between linear and rotary because linear on an
 
 <p align="center">
     <a href="https://en.wikipedia.org/wiki/Primordial_soup">
-        <img src="assets/soup.gif">
+        <img src="soup/soup.gif">
     </a>
 </p>
 
@@ -54,7 +54,7 @@ Only axis 0 (base) can be changed between linear and rotary because linear on an
 
 <p align="center">
     <a href="https://en.wikipedia.org/wiki/Computer-aided_design">
-        <img src="assets/cad.gif">
+        <img src="cad/cad.gif">
     </a>
 </p>
 
@@ -65,7 +65,7 @@ Completed by [face selection](https://en.wikipedia.org/wiki/Ray_casting) for dis
 
 <p align="center">
     <a href="https://en.wikipedia.org/wiki/Plan_position_indicator">
-        <img src="assets/ppi.gif">
+        <img src="ppi/ppi.gif">
     </a>
 </p>
 
