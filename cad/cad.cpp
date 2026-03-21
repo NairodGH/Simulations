@@ -259,7 +259,7 @@ static void drawDistFaceHighlight(const CadModel& model)
     rlEnableBackfaceCulling();
 }
 
-// computes the axis-aligned bounding box of the face in draw space (with centering applied)
+// computes the AABB of the face in draw space (with centering applied)
 static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center, Vector3 offset = { 0.0f, 0.0f, 0.0f })
 {
     BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
@@ -292,11 +292,20 @@ static float computeFaceMinDistance(
     int countB = (int)faceB.vertices.size() / 6;
     for (int i = 0; i < countA; i++) {
         int baseA = i * 3;
+        float ax = faceA.vertices[baseA] + offsetA.x;
+        float ay = faceA.vertices[baseA + 1] + offsetA.y;
+        float az = faceA.vertices[baseA + 2] + offsetA.z;
         for (int j = 0; j < countB; j++) {
             int baseB = j * 3;
-            float dx = (faceA.vertices[baseA] + offsetA.x) - (faceB.vertices[baseB] + offsetB.x);
-            float dy = (faceA.vertices[baseA + 1] + offsetA.y) - (faceB.vertices[baseB + 1] + offsetB.y);
-            float dz = (faceA.vertices[baseA + 2] + offsetA.z) - (faceB.vertices[baseB + 2] + offsetB.z);
+            float dx = ax - (faceB.vertices[baseB] + offsetB.x);
+            float dy = ay - (faceB.vertices[baseB + 1] + offsetB.y);
+            float dz = az - (faceB.vertices[baseB + 2] + offsetB.z);
+            // the sphere (your current best distance) fits inside a cube whose side equals the diameter, if you're already outside the cube on any single wall
+            // then you're outside the sphere, checking one wall costs one abs
+            // (which is cheaper than even a multiplication because it's just zeroing one bit of the float)
+            float eps = sqrtf(minDistSq);
+            if (std::abs(dx) >= eps || std::abs(dy) >= eps || std::abs(dz) >= eps)
+                continue;
             float dSq = dx * dx + dy * dy + dz * dz;
             if (dSq < minDistSq)
                 minDistSq = dSq;

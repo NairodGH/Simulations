@@ -41,7 +41,21 @@ static double cross2D(Vec2 a, Vec2 b, Vec2 c) { return (b.u - a.u) * (c.v - a.v)
 static bool pointIn2DTriangle(Vec2 point, Vec2 a, Vec2 b, Vec2 c)
 {
     double cross1 = cross2D(point, a, b), cross2 = cross2D(point, b, c), cross3 = cross2D(point, c, a);
-    return !((cross1 < 0 || cross2 < 0 || cross3 < 0) && (cross1 > 0 || cross2 > 0 || cross3 > 0));
+    // memcpy into uint64_t is defined behaviour and compiles to a zero-cost register move (no actual memory touch) and IEEE 754 already stores the sign of a
+    // double in last bit 63, packing those sign bits into a 3-bit mask lets us just use them at once instead of doing an ugly
+    // !((cross1 < 0 || cross2 < 0 || cross3 < 0) && (cross1 > 0 || cross2 > 0 || cross3 > 0))
+    // ex:cross1=+1.0 -> b1=0x3FF0..., b1>>63 = 0 (positive)
+    //    cross2=-0.5 -> b2=0xBFE0..., b2>>63 = 1 (negative)
+    //    mask = 0b010 -> mixed signs -> point is outside
+    uint64_t b1, b2, b3;
+    memcpy(&b1, &cross1, 8);
+    memcpy(&b2, &cross2, 8);
+    memcpy(&b3, &cross3, 8);
+    int mask = (int)(b1 >> 63) << 2 | (int)(b2 >> 63) << 1 | (int)(b3 >> 63);
+    // mask == 0b000 = all positive (CCW winding, point is inside)
+    // mask == 0b111 = all negative (CW winding, point is inside)
+    // anything else = mixed signs (point is outside)
+    return mask == 0b000 || mask == 0b111;
 }
 
 // ear-clip a simple polygon, returns triangle indices into 'polygon'
@@ -216,9 +230,7 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
     for (int h = 0; h < (int)holes.size(); h++)
         for (auto& vertex : holes[h])
             rightmostU[h] = std::max(rightmostU[h], vertex.u);
-    std::sort(holeOrder.begin(), holeOrder.end(), [&](int holeA, int holeB) {
-        return rightmostU[holeA] > rightmostU[holeB];
-    });
+    std::sort(holeOrder.begin(), holeOrder.end(), [&](int holeA, int holeB) { return rightmostU[holeA] > rightmostU[holeB]; });
 
     std::vector<Vec2> merged = outer;
 
@@ -303,8 +315,8 @@ static void appendTri(TessellatedFace& face, int a, int b, int c)
 
 // generic UV grid: positionFn(u,v) and normalFn(u,v) lambdas, u in [u0,u1] x v in [v0,v1]
 // emits front-facing triangles (CCW from outside), backface culling disabled at draw time
-TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v)> positionFn, std::function<Vec3(double u, double v)> normalFn,
-    double u0, double u1, int uSteps, double v0, double v1, int vSteps)
+TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v)> positionFn, std::function<Vec3(double u, double v)> normalFn, double u0,
+    double u1, int uSteps, double v0, double v1, int vSteps)
 {
     TessellatedFace face;
     face.kind = kind;
@@ -409,9 +421,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
         return origin + radialDir * radius + Z * v;
     };
     // outward radial direction (same for all v at a given u),  ex: u=0 -> normal=(1,0,0);  u=pi/2 -> normal=(0,1,0)
-    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 {
-        return (X * std::cos(u) + Y * std::sin(u));
-    };
+    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 { return (X * std::cos(u) + Y * std::sin(u)); };
     return tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, heightMin, heightMax, 1);
 }
 
@@ -671,7 +681,7 @@ Mesh uploadMesh(const TessellatedFace& tessellatedFace)
 }
 
 #pragma region geometry healing
-// retessellates the GPU mesh of a cylinder face with updated [heightMin, heightMax] and re-uploads it
+// retessellates the GPU mesh of a cylinder face with updated [heightMin, heightMax] and re-uploads it,
 // the CPU pickData is also replaced so ray picking and stats remain accurate
 void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double newHeightMax)
 {
@@ -680,43 +690,68 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
     Vec3 Y = Z.cross(X).norm();
     double radius = surf.majorRadius;
 
-    // reconstruct the angle range from the existing pickData (we cannot re-run sampleLoop without the StepMap)
-    // use the largest-gap method: sort all sampled angles, find the biggest empty sector, then define the arc
-    // as the complement so arcs straddling the atan2 +-pi discontinuity are handled correctly
-    // ex: arc from 150 to 210 deg straddles pi -> raw min=-pi, raw max~pi, naive span~2pi -> wrongly treated as full circle
-    //     largest-gap method finds the gap from ~210 to ~150 (the ~300 deg empty sector) and takes the complement (~60 deg arc)
+    // imagine a manual clock, each vertex is a clock stick, delta.dot(X)/delta.dot(Y) are already its (X,Y)
+    // position on the clock face (= cos/sin of its angle), we never need to label it as "37 degrees"
+    // just to sort it, we sort hands by position directly and only produce degree-labels at the very end
     const TessellatedFace& oldFace = model.pickData[cylIdx];
     int frontVertexCount = (int)oldFace.vertices.size() / 6;
-    std::vector<double> angles;
-    angles.reserve(frontVertexCount);
+    // read the clock stick, record each vertex as its (X,Y) position on the unit circle
+    // (delta.dot(X)*invRadius, delta.dot(Y)*invRadius) = where the stick points on the clock face, no label (atan2) needed yet
+    std::vector<std::pair<double, double>> projections;
+    projections.reserve(frontVertexCount);
+    double invRadius = (radius > 1e-14) ? 1.0 / radius : 1.0;
     for (int vi = 0; vi < frontVertexCount; vi++) {
         int base = vi * 3;
         Vec3 pt = { oldFace.vertices[base], oldFace.vertices[base + 1], oldFace.vertices[base + 2] };
         Vec3 delta = pt - origin;
-        angles.push_back(std::atan2(delta.dot(Y), delta.dot(X)));
+        // the stick's position on the clock face, dot(X)*invRadius is cos(theta), dot(Y)*invRadius is sin(theta), no atan2 required
+        projections.push_back({ delta.dot(X) * invRadius, delta.dot(Y) * invRadius });
     }
+    // remove duplicate sticks pointing at the same spot before sorting
+    std::sort(projections.begin(), projections.end());
+    projections.erase(std::unique(projections.begin(), projections.end(),
+                          [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+                              return std::abs(a.first - b.first) < 1e-9 && std::abs(a.second - b.second) < 1e-9;
+                          }),
+        projections.end());
+    // sort sticks by position without labelling them, upper half of the clock face (second >= 0, ex: 12 o'clock through 3 to 6) comes before lower half
+    // (6 through 9 to 12), and within each half sticks are ordered by their X position so the full sequence sweeps CCW around the face
+    // ex: (1,0)=3 o'clock, (0,1)=12 o'clock -> both upper half, X=1 > X=0 -> 3 o'clock before 12 (CCW: 0->90deg)
+    std::sort(projections.begin(), projections.end(), [](const std::pair<double, double>& a, const std::pair<double, double>& b) {
+        bool aUpper = a.second >= 0, bUpper = b.second >= 0;
+        if (aUpper != bUpper)
+            return aUpper; // upper half before lower
+        return aUpper ? (a.first > b.first) : (a.first < b.first);
+    });
     double angleMin = 0, angleMax = 2 * M_PI;
-    if (!angles.empty()) {
-        std::sort(angles.begin(), angles.end());
-        angles.erase(std::unique(angles.begin(), angles.end()), angles.end());
+    if (!projections.empty()) {
         double biggestGap = 0;
         int gapAfter = 0;
-        for (int i = 0; i < (int)angles.size(); i++) {
-            double next = (i + 1 < (int)angles.size()) ? angles[i + 1] : angles[0] + 2 * M_PI;
-            double gap = next - angles[i];
+        for (int i = 0; i < (int)projections.size(); i++) {
+            // find the biggest empty stretch of clock face (the arc that has no sticks in it),
+            // atan2 is called here on adjacent pairs only to measure gap sizes, not on every vertex
+            auto& cur = projections[i];
+            auto& next = projections[(i + 1) % (int)projections.size()];
+            double aCur = std::atan2(cur.second, cur.first);
+            double aNext = std::atan2(next.second, next.first);
+            double gap = aNext - aCur;
+            if (gap <= 0)
+                gap += 2 * M_PI; // wrap around midnight
             if (gap > biggestGap) {
                 biggestGap = gap;
                 gapAfter = i;
             }
         }
-        // if the biggest gap covers almost everything, it's a full revolution
         if (biggestGap > 1.9 * M_PI) {
             angleMin = 0;
             angleMax = 2 * M_PI;
         } else {
-            angleMin = angles[(gapAfter + 1) % (int)angles.size()];
-            angleMax = angles[gapAfter] + (angleMin > angles[gapAfter] ? 0 : 2 * M_PI);
-            // normalise so angleMax > angleMin
+            // label the two sticks that border the empty stretch, those are the arc endpoints, atan2 is called twice (gapEnd and gapStart) to produce the
+            // degree-labels tessGrid needs, the whole sort above never needed labels at all
+            auto& gapEnd = projections[(gapAfter + 1) % (int)projections.size()];
+            auto& gapStart = projections[gapAfter];
+            angleMin = std::atan2(gapEnd.second, gapEnd.first);
+            angleMax = std::atan2(gapStart.second, gapStart.first);
             while (angleMax <= angleMin)
                 angleMax += 2 * M_PI;
         }
@@ -729,9 +764,7 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
         Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
         return origin + radialDir * radius + Z * v;
     };
-    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 {
-        return (X * std::cos(u) + Y * std::sin(u));
-    };
+    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 { return (X * std::cos(u) + Y * std::sin(u)); };
     TessellatedFace newFace = tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, newHeightMin, newHeightMax, 1);
 
     // unload the old GPU mesh and upload the new one
@@ -761,10 +794,14 @@ static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff,
         float pz = planeData.vertices[baseP + 2] + planeOff.z;
         for (int j = 0; j < cylCount; j++) {
             int baseC = j * 3;
-            float cx = cylData.vertices[baseC] + cylOff.x;
-            float cy = cylData.vertices[baseC + 1] + cylOff.y;
-            float cz = cylData.vertices[baseC + 2] + cylOff.z;
-            float dx = px - cx, dy = py - cy, dz = pz - cz;
+            float dx = px - (cylData.vertices[baseC] + cylOff.x);
+            float dy = py - (cylData.vertices[baseC + 1] + cylOff.y);
+            float dz = pz - (cylData.vertices[baseC + 2] + cylOff.z);
+            // the sphere (your current best distance) fits inside a cube whose side equals the diameter, if you're already outside the cube on any single wall
+            // then you're outside the sphere, checking one wall costs one abs
+            // (which is cheaper than even a multiplication because it's just zeroing one bit of the float)
+            if (std::abs(dx) >= eps || std::abs(dy) >= eps || std::abs(dz) >= eps)
+                continue;
             if (dx * dx + dy * dy + dz * dz < epsSq)
                 return true;
         }
@@ -847,9 +884,6 @@ void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cac
             newHeightMax = chr.heightMax + signedDelta;
         else
             newHeightMin = chr.heightMin + signedDelta;
-        // when the moving cap crosses through the fixed cap the range inverts:
-        // swap min and max so the cylinder reflects through its fixed cap, and flip isMaxCap so the
-        // same plane direction continues shrinking/growing the correct (now-opposite) cap next frame
         // ex: plane pushes top cap down past the bottom -> range [0,5] becomes [5,0] -> swap to [0,5] reflected, flip cap
         if (newHeightMax < newHeightMin) {
             std::swap(newHeightMin, newHeightMax);
