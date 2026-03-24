@@ -27,7 +27,7 @@ static const Color targetColors[10] = {
 struct Target {
     float xKilometers, yKilometers;
     float velocityX, velocityY;
-    int colorIndex;
+    int colorId;
     float lastDetectionTime = -999.f;
 };
 

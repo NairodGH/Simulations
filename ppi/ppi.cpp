@@ -83,7 +83,7 @@ static float passiveSignalStrength(float rangeKilometers, float thermoclineNorma
 }
 
 // spawns a target at a random position and heading somewhere in the operational area
-static Target makeTarget(int colorIndex)
+static Target makeTarget(int colorId)
 {
     float angle = (std::rand() % 3600) * (float)M_PI / 1800.f; // 0 to 2pi, random spawn direction
     float distance = 15.f + std::rand() % 70; // 15 to 85 km from center
@@ -91,7 +91,7 @@ static Target makeTarget(int colorIndex)
     float course = (std::rand() % 3600) * (float)M_PI / 1800.f; // random initial heading
     return { std::sin(angle) * distance, std::cos(angle) * distance, // initial position
         std::sin(course) * speed, std::cos(course) * speed, // initial velocity
-        colorIndex, -999.f };
+        colorId, -999.f };
 }
 
 // adjusts the live target list to match the desired count without rebuilding everything
@@ -159,7 +159,7 @@ static void updateDetections(SonarState& sonarState, Vector2 center, float radiu
             continue; // too soon since the last ping on this target
         target.lastDetectionTime = sonarState.elapsedSeconds;
 
-        Color color = targetColors[target.colorIndex];
+        Color color = targetColors[target.colorId];
 
         if (sonarState.activeMode) {
             float signalStrength = activeSignalStrength(rangeKilometers, sonarState.thermoclineNormalized, sonarState.deepSpeedBoost);
@@ -174,9 +174,9 @@ static void updateDetections(SonarState& sonarState, Vector2 center, float radiu
             if (signalStrength <= 0.f)
                 continue;
             // map bearing (0-360) to one of 720 bins by simple proportion, ex: bearing 180 deg -> bin 360
-            int binIndex = (int)(bearing / 360.f * passiveBinCount) % passiveBinCount;
-            sonarState.passiveBins[binIndex].alpha = 1.0f;
-            sonarState.passiveBins[binIndex].color = color;
+            int binId = (int)(bearing / 360.f * passiveBinCount) % passiveBinCount;
+            sonarState.passiveBins[binId].alpha = 1.0f;
+            sonarState.passiveBins[binId].color = color;
         }
     }
 }
@@ -254,14 +254,14 @@ static void drawPPI(SonarState& sonarState, Vector2 center, float radius)
     // passive mode: draw a radial line from center to the disc edge for each lit bin,
     // the line goes all the way to the edge because passive sonar has no range information
     if (!sonarState.activeMode) {
-        for (int binIndex = 0; binIndex < passiveBinCount; ++binIndex) {
-            if (sonarState.passiveBins[binIndex].alpha < 0.01f)
+        for (int binId = 0; binId < passiveBinCount; ++binId) {
+            if (sonarState.passiveBins[binId].alpha < 0.01f)
                 continue;
-            float bearing = binIndex * 360.f / passiveBinCount;
+            float bearing = binId * 360.f / passiveBinCount;
             Vector2 direction = bearingToDirection(bearing);
             Vector2 endpoint = { center.x + direction.x * radius, center.y + direction.y * radius };
-            Color color = sonarState.passiveBins[binIndex].color;
-            color.a = (unsigned char)(sonarState.passiveBins[binIndex].alpha * 235);
+            Color color = sonarState.passiveBins[binId].color;
+            color.a = (unsigned char)(sonarState.passiveBins[binId].alpha * 235);
             DrawLineV(center, endpoint, color);
         }
     }
@@ -348,9 +348,9 @@ static void drawSoundSpeedProfile(const SonarState& sonarState, float x, float y
     // map both depth (0 to 1 -> topEdge to bottomEdge) and speed (1420 to 1630 -> leftEdge to rightEdge) to pixels,
     // then draw each consecutive pair as a short line, 100 segments is visually smooth enough
     constexpr int segmentCount = 100;
-    for (int segmentIndex = 1; segmentIndex <= segmentCount; ++segmentIndex) {
-        float depthStart = (segmentIndex - 1) / (float)segmentCount;
-        float depthEnd = segmentIndex / (float)segmentCount;
+    for (int segmentId = 1; segmentId <= segmentCount; ++segmentId) {
+        float depthStart = (segmentId - 1) / (float)segmentCount;
+        float depthEnd = segmentId / (float)segmentCount;
         float speedStart = soundSpeedMetersPerSecond(depthStart, sonarState.thermoclineNormalized, sonarState.deepSpeedBoost);
         float speedEnd = soundSpeedMetersPerSecond(depthEnd, sonarState.thermoclineNormalized, sonarState.deepSpeedBoost);
         // (speed - axisMin) / axisRange maps m/s value to a 0 to 1 position, then scale to pixel width

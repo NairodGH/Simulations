@@ -69,9 +69,9 @@ StepMap parseStepFile(const std::string& path)
     if (!file)
         throw std::runtime_error("Cannot open: " + path);
     StepMap entityMap;
-    std::string line, accum;
+    std::string line, accumulator;
     bool inData = false;
-    // matches a complete STEP entity line after accum flushes at ';':
+    // matches a complete STEP entity line after accumulator flushes at ';':
     //   group 1 = numeric ID after '#', ex: "12" in "#12 = ..."
     //   group 2 = entity type keyword, ex: "CARTESIAN_POINT"
     //   group 3 = raw parameter string,  ex: "'',( 1.0, 2.0, 3.0)"
@@ -98,12 +98,12 @@ StepMap parseStepFile(const std::string& path)
             trimmedLine.erase(commentStart, (commentEnd == std::string::npos ? trimmedLine.size() : commentEnd + 2) - commentStart);
         }
         // STEP entities can span multiple lines so accumulate until the terminating ';'
-        accum += trimmedLine;
-        if (!accum.empty() && accum.back() == ';') {
+        accumulator += trimmedLine;
+        if (!accumulator.empty() && accumulator.back() == ';') {
             std::smatch match;
-            if (std::regex_search(accum, match, entityRegex))
+            if (std::regex_search(accumulator, match, entityRegex))
                 entityMap[std::stoi(match[1])] = { match[2], match[3] };
-            accum.clear();
+            accumulator.clear();
         }
     }
     return entityMap;
@@ -186,12 +186,10 @@ Surface resolveSurface(int id, const StepMap& map)
 }
 
 #pragma region sample curves
-// a CIRCLE arc from startPt to endPt (or full revolution if isClosedLoop)
-// sameSense: effective arc direction = EDGE_CURVE same_sense XOR ORIENTED_EDGE edgeReversed
-// true = CCW sweep (angleEnd > angleStart), false = CW sweep (angleEnd < angleStart, short arc the other way)
-// reversing an edge traversal also reverses which arc direction is the correct short arc, hence the XOR
+// sample a CIRCLE arc from startPt to endPt (or full revolution if isClosedLoop) with a radius and arcSegs LOD
+// sameSense true = CCW sweep (angleEnd > angleStart), false = CW sweep (angleEnd < angleStart, short arc the other way)
 // ex: same_sense=.T., edgeReversed=true -> effective false -> CW sweep takes the 75 deg arc, not the 285 deg one
-static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isClosedLoop, const StepMap& map, int segs, bool sameSense = true)
+static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isClosedLoop, const StepMap& map, int arcSegs, bool sameSense = true)
 {
     auto entityIt = map.find(id);
     if (entityIt == map.end())
@@ -205,16 +203,16 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
     double radius = dbl(params[2]);
     Vec3 O = placement.origin, Z = placement.zDir.norm(), X = placement.xDir.norm(), Y = Z.cross(X).norm();
 
-    // returns the angle of 'pt' in the circle's local XY plane (atan2 in [-pi, pi])
-    // ex: pt on the +X side -> 0.0,  pt on the +Y side -> pi/2
-    auto angleOf = [&](Vec3 pt) {
-        Vec3 delta = pt - O;
+    // returns the angle of point in the circle's local XY plane (atan2 in [-pi, pi])
+    // ex: point on the +X side -> 0.0,  point on the +Y side -> pi/2
+    auto angleOf = [&](Vec3 point) {
+        Vec3 delta = point - O;
         return std::atan2(delta.dot(Y), delta.dot(X));
     };
 
     double angleStart, angleEnd;
     if (isClosedLoop) {
-        // full revolution: 0 -> 2pi, sample 'segs' segments
+        // full revolution: 0 -> 2pi, sample 'arcSegs' segments
         angleStart = 0;
         angleEnd = 2 * M_PI;
     } else if (sameSense) {
@@ -239,23 +237,33 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
             angleEnd = angleStart - 2 * M_PI;
     }
     // scale segment count proportionally to the arc fraction of a full circle
-    // ex: segs=48, quarter arc (pi/2 out of 2pi) -> numSegments = max(2, 48*0.25) = 12 segments
+    // ex: arcSegs=48, quarter arc (pi/2 out of 2pi) -> numSegments = max(2, 48*0.25) = 12 segments
     // always emit at least 2 points (start + end) for degenerate near-zero arcs
-    int numSegments = isClosedLoop ? segs : std::max(2, (int)(segs * std::abs(angleEnd - angleStart) / (2 * M_PI)));
+    int numSegments = isClosedLoop ? arcSegs : std::max(2, (int)(arcSegs * std::abs(angleEnd - angleStart) / (2 * M_PI)));
     std::vector<Vec3> points;
     points.reserve(numSegments + 1);
     for (int i = 0; i <= numSegments; i++) {
         double angle = angleStart + (angleEnd - angleStart) * (double)i / numSegments;
-        // point on circle: O + radius*(cos(angle)*X + sin(angle)*Y)
+        // finally the math curve part, point on circle = O + radius*(cos(angle)*X + sin(angle)*Y)
         points.push_back(O + X * std::cos(angle) * radius + Y * std::sin(angle) * radius);
     }
+    // the circle of radius 'radius' evaluated with arcSegs+1 points, tessGrid will copy it along the axis from start to end every vSteps, then connect
+    // the copied circles points together via UV grid, in real CAD kernels NURBS can do everything so we wouldn't have such perfect circle only sampling code
     return points;
 }
 
 // evaluate a B_SPLINE_CURVE_WITH_KNOTS using De Boor's algorithm
 // each round takes the current set of local control points and replaces them with a smaller set of blended points, until one point remains
 // basically what De Casteljau's algorithm is to Bézier curves, numerically stable and the standard way to evaluate splines
-static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const StepMap& map, int segs = 16)
+// imagine you're mixing paint colors, you have a row of 4 paint pots, in the first round you blend each adjacent pair together, getting 3 new mixed colors,
+// then you blend each adjacent pair of those, getting 2, then again for 1 final color:
+//  1    2    3    4
+//    12   23   34
+//      123  234
+//        1234
+// where you start blending (the t parameter) determines how much of each neighbor contributes at each round, so starting near pot 1 gives a result close to
+// pot 1's color and starting near pot 5 gives a result close to pot 5's color, the final single color is the point on the curve at that parameter value
+static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const StepMap& map, int arcSegs)
 {
     auto entityIt = map.find(id);
     if (entityIt == map.end())
@@ -263,18 +271,15 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     // B_SPLINE_CURVE_WITH_KNOTS params:
     //   (name, degree, (ctrl_pts...), curve_form, closed_curve, self_intersect, (knot_multiplicities...), (knots...), knot_spec)
     // ex degree-3 curve: "('', 3, (#60,#61,#62,#63), .UNSPECIFIED., .F., .F., (4,4), (0.,1.), .UNSPECIFIED.)"
-    // degree = how smoothly the track bends, 1 = straight line segments between posts, 2 = gentle bends,
-    //      3 = standard for CAD, smooth enough that you cannot feel the joints at all
-    // ctrl_pts = the posts you place in space that the track is attracted to but does not necessarily touch, move a post and the track bends toward it
-    //      4 control points = minimum for a degree-3 curve
-    //  curve_form means the overall shape family: .UNSPECIFIED., .CIRCULAR_ARC. or .ELLIPTIC_ARC. (informational only)
-    // closed_curve .F. means the track has a start and an end, .T. means it loops back on itself like a circuit (informational only)
-    // self_intersect .F. means the track never crosses itself, .T. means it does  (informational only)
-    // knot_multiplicities= how many times each knot value is repeated, with (4,4) means the first andl last knots aree repeated 4 times
-    //      repeating a knot degree times at each end is what forces the curve to actually start and end at the first and last control points respectively
-    //      rather than just being attracted to them, this is called a clamped B-spline
-    // knots = the actual knot values, (0., 1.) combined with the multiplicities this expands to (0, 0, 0, 0, 1, 1, 1, 1) which is our
-    //      8 values for 4 control points at degree 3, satisfying the n + degree + 1 rule
+    // degree = how many neighboring pots influence each blend round, 1 = only immediate neighbor, 3 = standard for CAD, smooth enough that you cannot feel the
+    // joints at all ctrl_pts = the paint pots themselves, the curve is attracted to them but does not necessarily touch them (except at the endpoints)
+    // curve_form means the overall shape family: .UNSPECIFIED., .CIRCULAR_ARC. or .ELLIPTIC_ARC. (informational only)
+    // closed_curve .F. means the row of pots has a start and an end, .T. means it loops back on itself (informational only)
+    // self_intersect .F. means the resulting path never crosses itself (informational only)
+    // knot_multiplicities = how many times each knot is repeated, repeating a knot degree+1 times at each end forces the curve to actually
+    //      start and end at the first and last pots rather than just being attracted to them, this is called a clamped B-spline
+    // knots = the t values where blending behavior changes, (0., 1.) combined with multiplicities (4,4) expands to (0,0,0,0,1,1,1,1),
+    //      8 values for 4 pots at degree 3, satisfying the n + degree + 1 rule
     // knot_spec = knot distribution type (uniform, quasi-uniform...), .UNSPECIFIED. is almost always what you see in exported STEP files
     auto params = splitTopLevel(entityIt->second.params);
     if (params.size() < 3)
@@ -286,13 +291,12 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
         if (refId > 0)
             controlPoints.push_back(resolvePoint(refId, map));
     }
-    // need at least degree+1 control points to evaluate a valid curve
-    // ex: degree 3 needs at least 4 control points
+    // need at least degree+1 pots to have enough neighbors to blend down to 1
     if ((int)controlPoints.size() <= degree)
         return { startPt, endPt };
-    // scan remaining params for the knot vector: skip the first parenthesised plain-float list (the multiplicity list)
+    // scan remaining params for the knot vector, skip the first parenthesised plain-float list (the multiplicity list)
     // and accept the second one, which is the actual knot vector
-    // ex: 4 ctrl pts, degree 3 -> need 4+3+1=8 knots, ex: (0,0,0,0,1,1,1,1)
+    // ex: 4 pots, degree 3 -> need 4+3+1=8 knots, ex: (0,0,0,0,1,1,1,1)
     std::vector<double> knots;
     int floatListsSeen = 0;
     for (int i = 3; i < (int)params.size() && knots.empty(); i++) {
@@ -327,44 +331,42 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     }
     if (knots.empty())
         return { startPt, endPt };
-    // valid parameter domain: [knots[degree], knots[n-1-degree]] (clamped B-spline convention)
+    // valid blending range = [knots[degree], knots[n-1-degree]], outside this range there aren't enough pots on both sides to blend
     // ex: knots=(0,0,0,0,1,1,1,1), degree=3 -> tMin=knots[3]=0, tMax=knots[4]=1
     double tMin = knots[degree], tMax = knots[(int)knots.size() - 1 - degree];
 
-    // De Boor's algorithm: evaluate the B-spline at parameter t, finds the knot span k such that knots[k] <= t < knots[k+1]
-    // then runs degree rounds of linear interpolation on the local control polygon
-    // ex: degree=3, t=0.5 on [0 to 1] -> picks the span containing 0.5, blends 4 local ctrl pts down to 1
+    // De Boor's algorithm: given t, find which group of pots are the local neighbors, then blend them down round by round until 1 color remains
     auto deBoor = [&](double t) -> Vec3 {
-        // find knot span index (clamped to the last valid span)
-        int spanIndex = degree, lastSpan = (int)knots.size() - 2 - degree;
+        // find which knot span t falls into, i.e. which group of pots are the local neighbors for this t
+        int spanId = degree, lastSpan = (int)knots.size() - 2 - degree;
         for (int i = degree; i < (int)knots.size() - 1 - degree; i++) {
             if (t < knots[i + 1]) {
-                spanIndex = i;
+                spanId = i;
                 break;
             }
-            spanIndex = lastSpan;
+            spanId = lastSpan;
         }
-        // local control points for this span: controlPoints[spanIndex-degree to spanIndex]
-        std::vector<Vec3> localPoints(controlPoints.begin() + spanIndex - degree, controlPoints.begin() + spanIndex + 1);
-        // degree rounds of De Boor triangular interpolation:
-        // each round replaces degree+1-r points with r-blended values
-        // ex: degree=3, r=1: blend indices 3,2,1; r=2: blend 3,2; r=3: blend 3 -> final point
+        // grab the local pots for this span, degree+1 pots = one full blending pyramid
+        std::vector<Vec3> localPoints(controlPoints.begin() + spanId - degree, controlPoints.begin() + spanId + 1);
+        // blend round by round: each round reduces the row of pots by 1 until only 1 remains
+        // ex: degree=3 starts with 4 pots -> round 1 gives 3 -> round 2 gives 2 -> round 3 gives the final 1
         for (int r = 1; r <= degree; r++)
             for (int j = degree; j >= r; j--) {
-                double knotSpanWidth = knots[spanIndex - degree + j + r] - knots[spanIndex - degree + j];
-                // blend factor alpha, says how far along a knot interval the evaluation point is, used to linearly blend between two control points
-                // guard against zero-length knot spans (repeated knots at boundary) which would cause division by 0
-                // ex: clamped endpoint where knots[k]=knots[k+1] -> knotSpanWidth=0, use alpha=0 to pin to left control point
-                double alpha = (knotSpanWidth < 1e-12) ? 0.0 : (t - knots[spanIndex - degree + j]) / knotSpanWidth;
+                double knotSpanWidth = knots[spanId - degree + j + r] - knots[spanId - degree + j];
+                // alpha says how close t is to the right pot vs the left pot in this pair, 0 = all left, 1 = all right
+                // guard against repeated knots at boundaries (knotSpanWidth=0) which would cause division by zero, pin to left pot in that case
+                double alpha = (knotSpanWidth < 1e-12) ? 0.0 : (t - knots[spanId - degree + j]) / knotSpanWidth;
                 localPoints[j] = localPoints[j - 1] * (1 - alpha) + localPoints[j] * alpha;
             }
         return localPoints[degree];
     };
+    // ask for the final mixed color at segs+1 evenly spaced positions along the row of pots, from the first pot to the last,
+    // and collecting all those colors into a list, that list is the polyline approximating the curve
     std::vector<Vec3> points;
-    points.reserve(segs + 1);
-    for (int i = 0; i <= segs; i++)
-        points.push_back(deBoor(tMin + (tMax - tMin) * (double)i / segs));
-    return points;
+    points.reserve(arcSegs + 1);
+    for (int i = 0; i <= arcSegs; i++)
+        points.push_back(deBoor(tMin + (tMax - tMin) * (double)i / arcSegs));
+    return points; // same as circle, NURBS would do it all and better since it can do a perfect circle which simple B-spline cannot
 }
 
 #pragma region sampleLoop
@@ -382,22 +384,24 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
     BoundaryLoop loop;
     auto boundIt = map.find(boundId);
     if (boundIt == map.end())
-        return loop;
+        throw std::runtime_error("FACE_BOUND missing at #" + std::to_string(boundId));
     loop.isOuter = (boundIt->second.type == "FACE_OUTER_BOUND");
     // FACE_OUTER_BOUND / FACE_BOUND params: (name, edge_loop_ref, orientation)
-    // ex: "('', #100, .T.)" -> edge loop is entity #100
+    // ex: "( 'NONE', #318, .T. )" -> EDGE_LOOP is entity #318 (orientation is "edge loop runs clockwise or counterclockwise" but we don't care yet)
     auto boundParams = splitTopLevel(boundIt->second.params);
     if (boundParams.size() < 2)
-        return loop;
+        throw std::runtime_error("FACE_BOUND missing params at #" + std::to_string(stepRef(boundParams[1])));
     auto loopIt = map.find(stepRef(boundParams[1]));
-    if (loopIt == map.end() || loopIt->second.type != "EDGE_LOOP")
-        return loop;
+    if (loopIt == map.end() || loopIt->second.type != "EDGE_LOOP") // ref should always lead to EDGE_LOOP
+        throw std::runtime_error("EDGE_LOOP missing at #" + std::to_string(stepRef(boundParams[1])));
     // EDGE_LOOP params: (name, (oriented_edge_ref, ...))
-    // ex: "('', (#110,#111,#112,#113))" -> 4 oriented edges forming a closed loop
+    // ex: "( 'NONE', ( #2513, #123 ) )" -> 2 oriented edges ("edges" aren't necessarily only 2 points,
+    // for a circle we could have 2 loops ach handle 180° of it for example)
     auto loopParams = splitTopLevel(loopIt->second.params);
-    if (loopParams.size() < 2)
-        return loop;
+    if (loopParams.size() < 2) // should always have 2 params
+        throw std::runtime_error("EDGE_LOOP missing params at #" + std::to_string(stepRef(boundParams[1])));
 
+    // since EDGE_LOOP has multiple refs, start looping through each
     for (auto& edgeRef : splitTopLevel(unwrap(trimWS(loopParams[1])))) {
         int orientedEdgeId = stepRef(trimWS(edgeRef));
         auto orientedEdgeIt = map.find(orientedEdgeId);
@@ -405,7 +409,7 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
             continue;
         // ORIENTED_EDGE params: (name, *, *, edge_curve_ref, orientation_flag)
         // orientation_flag ".F." means the edge is traversed in reverse (end->start)
-        // ex: "('', *, *, #120, .F.)" -> traverse edge #120 backwards
+        // ex: "( 'NONE', *, *, #2872, .T. )" -> traverse edge #2872 forward
         auto orientedEdgeParams = splitTopLevel(orientedEdgeIt->second.params);
         if (orientedEdgeParams.size() < 5)
             continue;
@@ -414,18 +418,22 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
         if (edgeCurveIt == map.end() || edgeCurveIt->second.type != "EDGE_CURVE")
             continue;
         // EDGE_CURVE params: (name, start_vertex_ref, end_vertex_ref, curve_ref, same_sense)
-        // ex: "('', #130, #131, #132, .T.)" -> goes from vtx #130 to vtx #131 along curve #132
-        // effective sameSense = rawSameSense XOR edgeReversed: reversing the edge traversal also
-        // reverses the arc direction, flipping which arc (short vs long) is the geometrically correct one
+        // ex: "( 'NONE', #1950, #238, #2523, .T. )" -> goes from vtx #1950 to vtx #238 along curve #2523
+        // when we say "curve" edge of a face, it can be a curve for cylinder or torus but also a line for a plane, it's just a general term
+        // same_sense = does the curve follow its parent's (ORIENTED_EDGE) orientation_flag (up there)
         auto edgeCurveParams = splitTopLevel(edgeCurveIt->second.params);
         if (edgeCurveParams.size() < 4)
             continue;
         bool rawSameSense = !(edgeCurveParams.size() >= 5 && trimWS(edgeCurveParams[4]) == ".F.");
-        bool sameSense = rawSameSense != edgeReversed; // XOR
+        // if both are flipped, they cancel out and you're back to the original arc direction (with 2 points on a circle there's always a shorter and longer arc
+        // (or both equal if opposite points), same_sense rawSameSense with edgeReversed tells you which way to go, get it wrong and instead of a
+        // 30 degree fillet arc you'd sample the 330 degree arc going the other way around the circle for example)
+        // so use XOR for two reversals = no reversal, one reversal = reversed
+        bool sameSense = rawSameSense != edgeReversed;
 
         int startVertexId = stepRef(edgeCurveParams[1]), endVertexId = stepRef(edgeCurveParams[2]);
         // if start and end vertex entity are the same ref, this edge is a closed circle (full revolution)
-        // ex: "#130 = VERTEX_POINT" for both startVertexId and endVertexId -> full-circle edge (ex: bolt head rim)
+        // ex: if "#1950 = VERTEX_POINT" for both startVertexId and endVertexId = full-circle edge
         bool fullCircle = (startVertexId == endVertexId && startVertexId > 0);
         if (fullCircle)
             loop.hasFullCircle = true;
@@ -435,7 +443,7 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
             auto vertexIt = map.find(vertexId);
             if (vertexIt == map.end() || vertexIt->second.type != "VERTEX_POINT")
                 return {};
-            // VERTEX_POINT params: (name, cartesian_point_ref), ex: "('', #140)" -> position = point[140]
+            // VERTEX_POINT params: (name, cartesian_point_ref), ex: "( 'NONE', #2929 )" -> position = point[2929]
             auto vertexParams = splitTopLevel(vertexIt->second.params);
             return (vertexParams.size() >= 2) ? resolvePoint(stepRef(vertexParams[1]), map) : Vec3 {};
         };
@@ -451,9 +459,9 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
             if (curveIt->second.type == "CIRCLE")
                 edgeSamples = sampleCircle(curveId, vertexStart, vertexEnd, fullCircle, map, arcSegs, sameSense);
             else if (curveIt->second.type == "LINE")
-                edgeSamples = { vertexStart, vertexEnd };
+                edgeSamples = { vertexStart, vertexEnd }; // step calls lines "curves" (just straight ones)
             else if (curveIt->second.type == "B_SPLINE_CURVE_WITH_KNOTS")
-                edgeSamples = sampleBSpline(curveId, vertexStart, vertexEnd, map, 16);
+                edgeSamples = sampleBSpline(curveId, vertexStart, vertexEnd, map, arcSegs);
             else
                 edgeSamples = { vertexStart, vertexEnd };
         } else
@@ -461,8 +469,8 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
 
         // append edge samples, skipping the junction duplicate with the previous edge
         // ex: prev edge ended at P, this edge starts at P -> skip index 0 to avoid [P,P] in the list
-        int startIndex = loop.points.empty() ? 0 : 1;
-        for (int i = startIndex; i < (int)edgeSamples.size(); i++)
+        int startId = loop.points.empty() ? 0 : 1;
+        for (int i = startId; i < (int)edgeSamples.size(); i++)
             loop.points.push_back(edgeSamples[i]);
     }
     // remove closing duplicate: STEP loops are closed, so the last point often coincides with the first, drop it so the polygon is a proper open ring

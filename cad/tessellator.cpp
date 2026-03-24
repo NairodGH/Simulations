@@ -1,5 +1,25 @@
 #include "cad.hpp"
 
+// appends a single vertex (position + normal) to the flat float arrays of a TessellatedFace
+// ex: pos=(1,0,0), nor=(1,0,0) -> pushes 6 floats: vertices=[...,1,0,0], normals=[...,1,0,0]
+static void appendVertex(TessellatedFace& face, Vec3 pos, Vec3 nor)
+{
+    face.vertices.push_back((float)pos.x);
+    face.vertices.push_back((float)pos.y);
+    face.vertices.push_back((float)pos.z);
+    face.normals.push_back((float)nor.x);
+    face.normals.push_back((float)nor.y);
+    face.normals.push_back((float)nor.z);
+}
+
+// appends a single triangle (three vertex indices) to the index list, ex: appendTri(face, 0, 1, 2) -> face.indices = [..., 0, 1, 2]
+static void appendTri(TessellatedFace& face, int a, int b, int c)
+{
+    face.indices.push_back(a);
+    face.indices.push_back(b);
+    face.indices.push_back(c);
+}
+
 #pragma region 2D ear-clip
 // imagine a polygon drawn on paper, an "ear" is any three consecutive vertices where the middle one can be cut off cleanly
 // the triangle formed by those three vertices lies entirely inside the polygon and contains no other vertices, ear-clipping just repeatedly
@@ -163,7 +183,7 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
 {
     int vertexCount = (int)polygon.size();
     double closestDistance = std::numeric_limits<double>::max();
-    int bestEdgeIndex = -1;
+    int bestEdgeId = -1;
 
     for (int i = 0; i < vertexCount; i++) {
         Vec2 edgeStart = polygon[i], edgeEnd = polygon[(i + 1) % vertexCount];
@@ -187,11 +207,11 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
             continue;
         if (distanceAlongRay < closestDistance) {
             closestDistance = distanceAlongRay;
-            bestEdgeIndex = i;
+            bestEdgeId = i;
         }
     }
 
-    if (bestEdgeIndex < 0) {
+    if (bestEdgeId < 0) {
         // fallback: nearest vertex (handles degenerate geometry where no edge is hit)
         double bestDistSq = std::numeric_limits<double>::max();
         int nearestVertex = 0;
@@ -208,7 +228,7 @@ static int findBridgeVertex(const std::vector<Vec2>& polygon, Vec2 rayOrigin)
     // of the two edge endpoints, pick the one with the larger X (more rightward),
     // which is guaranteed to be mutually visible from rayOrigin without crossing the edge
     // ex: edge endpoints (4,0) and (5,2) -> pick index of (5,2) since 5 > 4
-    int indexA = bestEdgeIndex, indexB = (bestEdgeIndex + 1) % vertexCount;
+    int indexA = bestEdgeId, indexB = (bestEdgeId + 1) % vertexCount;
     return (polygon[indexA].u >= polygon[indexB].u) ? indexA : indexB;
 }
 
@@ -234,35 +254,35 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
 
     std::vector<Vec2> merged = outer;
 
-    for (int holeIndex : holeOrder) {
-        const auto& hole = holes[holeIndex];
+    for (int holeId : holeOrder) {
+        const auto& hole = holes[holeId];
         if (hole.empty())
             continue;
 
         // find rightmost point of this hole (the bridge starts here)
-        int rightmostIndex = 0;
+        int rightmostId = 0;
         for (int i = 1; i < (int)hole.size(); i++)
-            if (hole[i].u > hole[rightmostIndex].u)
-                rightmostIndex = i;
-        Vec2 bridgeSource = hole[rightmostIndex];
+            if (hole[i].u > hole[rightmostId].u)
+                rightmostId = i;
+        Vec2 bridgeSource = hole[rightmostId];
 
         // find visible bridge vertex on the outer polygon using ray casting
-        int bridgeTargetIndex = findBridgeVertex(merged, bridgeSource);
+        int bridgeTargetId = findBridgeVertex(merged, bridgeSource);
 
-        // splice hole into merged polygon at bridgeTargetIndex:
-        // outer[0 to bridgeTargetIndex] -> hole[rightmostIndex to rightmostIndex-1] -> hole[rightmostIndex] (seam) -> outer[bridgeTargetIndex to end]
+        // splice hole into merged polygon at bridgeTargetId:
+        // outer[0 to bridgeTargetId] -> hole[rightmostId to rightmostId-1] -> hole[rightmostId] (seam) -> outer[bridgeTargetId to end]
         // the duplicated vertices are what create the "bridge cut"
-        // ex: outer=[A,B,C,D], bridgeTargetIndex=1 (=B), hole=[H0,H1,H2], rightmostIndex=0
+        // ex: outer=[A,B,C,D], bridgeTargetId=1 (=B), hole=[H0,H1,H2], rightmostId=0
         //  -> [A, B, H0,H1,H2, H0, B, C, D]  (B and H0 each appear twice = the two seam edges)
         std::vector<Vec2> spliced;
         spliced.reserve(merged.size() + hole.size() + 2);
-        for (int i = 0; i <= bridgeTargetIndex; i++)
+        for (int i = 0; i <= bridgeTargetId; i++)
             spliced.push_back(merged[i]);
         for (int i = 0; i < (int)hole.size(); i++)
-            spliced.push_back(hole[(rightmostIndex + i) % hole.size()]);
-        spliced.push_back(hole[rightmostIndex]); // close hole seam
-        spliced.push_back(merged[bridgeTargetIndex]); // bridge back to outer
-        for (int i = bridgeTargetIndex + 1; i < (int)merged.size(); i++)
+            spliced.push_back(hole[(rightmostId + i) % hole.size()]);
+        spliced.push_back(hole[rightmostId]); // close hole seam
+        spliced.push_back(merged[bridgeTargetId]); // bridge back to outer
+        for (int i = bridgeTargetId + 1; i < (int)merged.size(); i++)
             spliced.push_back(merged[i]);
         merged = std::move(spliced);
     }
@@ -281,6 +301,147 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
     return deduped;
 }
 
+#pragma region plane tessellation
+// boundary-driven + ear-clip with holes
+static TessellatedFace tessPlane(const Surface& surface, std::vector<BoundaryLoop>& loops, bool faceReversed)
+{
+    TessellatedFace face;
+    face.kind = SurfaceKind::Plane;
+
+    Vec3 normal = surface.axis.zDir.norm();
+    // STEP's FACE orientation flag: reversed face means the surface normal points inward
+    // ex: bottom face of a box has zDir pointing up, but face is reversed -> normal flipped to point down
+    if (faceReversed)
+        normal = normal * -1.0;
+    Vec3 tangentX = surface.axis.xDir.norm();
+    // if xDir is degenerate (near-zero), build an arbitrary tangent frame from normal
+    // ex: normal=(0,1,0) -> pick tangentX=(1,0,0), Gram-Schmidt -> tangentX stays (1,0,0)
+    //     normal=(1,0,0) -> pick tangentX=(0,1,0), Gram-Schmidt -> tangentX stays (0,1,0)
+    if (tangentX.len() < 0.5) {
+        tangentX = (std::abs(normal.x) < 0.9) ? Vec3 { 1, 0, 0 } : Vec3 { 0, 1, 0 };
+        // remove the component of tangentX along normal to guarantee perpendicularity (Gram-Schmidt, guarantee 90 degree angle)
+        // ex: tangentX=(1,0,0), normal=(0.6,0.8,0) -> tangentX -= 0.6*(0.6,0.8,0) = (0.64,-0.48,0), then normalized
+        tangentX = (tangentX - normal * tangentX.dot(normal)).norm();
+    }
+    // tangentY completes our coordinate system (tangentX, tangentY, normal)
+    // ex: normal=(0,0,1), tangentX=(1,0,0) -> tangentY = (0,0,1) x (1,0,0) = (0,1,0)
+    Vec3 tangentY = normal.cross(tangentX).norm();
+
+    // separate outer and inner (hole) loops
+    BoundaryLoop* outerLoop = nullptr;
+    std::vector<BoundaryLoop*> innerLoops;
+    for (auto& loop : loops) {
+        if (loop.isOuter)
+            outerLoop = &loop;
+        else
+            innerLoops.push_back(&loop);
+    }
+    // imagine you have a set of fence outlines on a map but none of them are labeled "outer boundary", you can find the outer fence by measuring
+    // which enclosed area is the largest, assuming the property boundary is always bigger than any holes it contains
+    if (!outerLoop && !loops.empty()) {
+        // fallback: no fence was labeled as the property boundary, find it by picking the largest enclosed area
+        double bestArea = -std::numeric_limits<double>::max();
+        for (auto& loop : loops) {
+            // project loop points onto the face plane to measure 2D area
+            std::vector<Vec2> projected;
+            Vec3 centroid = { 0, 0, 0 };
+            for (auto& point : loop.points)
+                centroid = centroid + point;
+            centroid = centroid * (1.0 / loop.points.size());
+            for (auto& point : loop.points) {
+                Vec3 delta = point - centroid;
+                projected.push_back({ delta.dot(tangentX), delta.dot(tangentY) });
+            }
+            // measure how much land this fence encloses
+            double loopArea = std::abs(area2D(projected));
+            // largest fence so far = most likely the property boundary
+            if (loopArea > bestArea) {
+                bestArea = loopArea;
+                outerLoop = &loop;
+            }
+        }
+    }
+    if (!outerLoop)
+        return face;
+
+    // computes the average position of all points across all loops (centroid of the face), then uses that as the origin for the 2D projection,
+    // instead of projecting raw STEP coordinates like 150.003 200.007 you project(0.003 0.007 relative to the centroid (the ear clipper does a lot of
+    // subtractions and cross products on those coordinates and working near zero avoids losing all precision when dealing with big numbers)
+    Vec3 centroid = { 0, 0, 0 };
+    int pointCount = 0;
+    for (auto& loop : loops)
+        for (auto& point : loop.points) {
+            centroid = centroid + point;
+            pointCount++;
+        }
+    if (pointCount)
+        centroid = centroid * (1.0 / pointCount);
+
+    // project 3D loop points onto the plane's local coordinate system
+    // ex: point=(3,0,1), centroid=(1,0,1), tangentX=(1,0,0), tangentY=(0,1,0) -> u=2, v=0
+    auto projectTo2D = [&](std::vector<Vec3>& points3D) -> std::vector<Vec2> {
+        std::vector<Vec2> projected;
+        for (auto& point : points3D) {
+            Vec3 delta = point - centroid;
+            projected.push_back({ delta.dot(tangentX), delta.dot(tangentY) });
+        }
+        return projected;
+    };
+
+    // build outer and hole 2D polygons
+    std::vector<Vec2> outerPoly = projectTo2D(outerLoop->points);
+    // ensure outer polygon is CCW, the GPU uses this to determine which side of a triangle is the front face,
+    // if you mix them up, normals point the wrong way and faces disappear or are lit backwards
+    // the ear-clipper must work in a consistent winding, and holes boundaries must be wound opposite to the outer boundary so the algorithm can tell them apart
+    // ex: area2D = -5 -> polygon is CW -> reverse to make it CCW
+    if (area2D(outerPoly) < 0) {
+        std::reverse(outerPoly.begin(), outerPoly.end());
+        std::reverse(outerLoop->points.begin(), outerLoop->points.end());
+        outerPoly = projectTo2D(outerLoop->points);
+    }
+    std::vector<std::vector<Vec2>> holePolygons;
+    for (auto* innerLoop : innerLoops) {
+        auto holePoly = projectTo2D(innerLoop->points);
+        // holes must be CW (opposite winding to outer)
+        // ex: bolt hole boundary sampled CCW (area > 0) -> reverse to CW so bridge merge works correctly
+        if (area2D(holePoly) > 0) {
+            std::reverse(holePoly.begin(), holePoly.end());
+            std::reverse(innerLoop->points.begin(), innerLoop->points.end());
+            holePoly = projectTo2D(innerLoop->points);
+        }
+        holePolygons.push_back(holePoly);
+    }
+
+    // build merged polygon (O'Rourke bridge cuts, sorted rightmost-first), use merged polygon vertices directly as GPU verts, reconstruct 3D from 2D
+    std::vector<Vec2> mergedPoly = buildMergedPolygon(outerPoly, holePolygons);
+    auto triangles = earClip(mergedPoly);
+    if (triangles.empty())
+        return face;
+
+    int mergedVertexCount = (int)mergedPoly.size();
+    // small offset along the normal to avoid z-fighting when two coplanar faces overlap
+    // ex: top cap of a cylinder sits flush against a flat face at the same Z -> offset by 0.0005 units
+    Vec3 offsetVec = normal * 5e-4;
+
+    // reconstruct 3D positions from 2D: pos3D = centroid + tangentX*u + tangentY*v
+    // ex: u=2, v=1, centroid=(0,0,5), tangentX=(1,0,0), tangentY=(0,1,0) -> pos3D=(2,1,5)
+    for (auto& vertex2D : mergedPoly) {
+        Vec3 pos3D = centroid + tangentX * vertex2D.u + tangentY * vertex2D.v;
+        appendVertex(face, pos3D + offsetVec, normal);
+    }
+    for (auto& vertex2D : mergedPoly) {
+        Vec3 pos3D = centroid + tangentX * vertex2D.u + tangentY * vertex2D.v;
+        appendVertex(face, pos3D + offsetVec, normal * -1.0);
+    }
+    // emit front and back vertex sets with opposite normals for double-sided rendering
+    for (auto& triangle : triangles)
+        appendTri(face, triangle[0], triangle[1], triangle[2]);
+    // reversed winding for back face ()
+    for (auto& triangle : triangles)
+        appendTri(face, triangle[0] + mergedVertexCount, triangle[2] + mergedVertexCount, triangle[1] + mergedVertexCount);
+    return face;
+}
+
 #pragma region uv grid
 // U and V are just parameter names for the two axes of a surface's own coordinate system, the same way X/Y are axes in world space,
 // a cylinder has U = angle around the axis (0 to 2π for a full revolution) and V = height along it (heightMin to heightMax),
@@ -289,29 +450,9 @@ static std::vector<Vec2> buildMergedPolygon(const std::vector<Vec2>& outer, cons
 // instead we tessellate the surface analytically in (u,v) parameter space and emit a clean quad grid
 // "analytically" here means the normal or position is computed from the closed-form mathematical definition of the surface
 // rather than estimated by, say, averaging the normals of surrounding triangles (tldr exact formula, no approximation)
-// inversely, we couldn't use this amazing UV grid for planes because it does not have a natural parameter space like cylinder's and tori's
+// inversely, we couldn't use this amazing UV grid for planes because it does not have a natural parameter space like cylinder's and toruses's
 // angle and height, a plane is infinite and has no intrinsic coordinate system (you have to invent one, tangentX/tangentY) and
 // its boundary shape can be absolutely anything, hence why a recursive exploratory algorithm like ear-clipper is better
-
-// appends a single vertex (position + normal) to the flat float arrays of a TessellatedFace
-// ex: pos=(1,0,0), nor=(1,0,0) -> pushes 6 floats: vertices=[...,1,0,0], normals=[...,1,0,0]
-static void appendVertex(TessellatedFace& face, Vec3 pos, Vec3 nor)
-{
-    face.vertices.push_back((float)pos.x);
-    face.vertices.push_back((float)pos.y);
-    face.vertices.push_back((float)pos.z);
-    face.normals.push_back((float)nor.x);
-    face.normals.push_back((float)nor.y);
-    face.normals.push_back((float)nor.z);
-}
-
-// appends a single triangle (three vertex indices) to the index list, ex: appendTri(face, 0, 1, 2) -> face.indices = [..., 0, 1, 2]
-static void appendTri(TessellatedFace& face, int a, int b, int c)
-{
-    face.indices.push_back(a);
-    face.indices.push_back(b);
-    face.indices.push_back(c);
-}
 
 // generic UV grid: positionFn(u,v) and normalFn(u,v) lambdas, u in [u0,u1] x v in [v0,v1]
 // emits front-facing triangles (CCW from outside), backface culling disabled at draw time
@@ -325,7 +466,7 @@ TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v
     int stride = uSteps + 1;
 
     // cache front-vertex positions so the back-vertex pass can reuse them without calling positionFn again
-    // (avoids duplicate sin/cos for cylinders and tori which compute radial direction inside positionFn)
+    // (avoids duplicate sin/cos for cylinders and toruses which compute radial direction inside positionFn)
     std::vector<Vec3> frontPos;
     frontPos.reserve((uSteps + 1) * (vSteps + 1));
 
@@ -449,191 +590,6 @@ static TessellatedFace tessTorus(const Surface& surface, int uSegments, int vSeg
     return tessGrid(SurfaceKind::Torus, positionFn, normalFn, 0, 2 * M_PI, uSegments, 0, 2 * M_PI, vSegments);
 }
 
-#pragma region plane tessellation
-// boundary-driven + ear-clip with holes
-static TessellatedFace tessPlane(const Surface& surface, std::vector<BoundaryLoop>& loops, bool faceReversed)
-{
-    TessellatedFace face;
-    face.kind = SurfaceKind::Plane;
-
-    Vec3 normal = surface.axis.zDir.norm();
-    // STEP's FACE orientation flag: reversed face means the surface normal points inward
-    // ex: bottom face of a box has zDir pointing up, but face is reversed -> normal flipped to point down
-    if (faceReversed)
-        normal = normal * -1.0;
-    Vec3 tangentX = surface.axis.xDir.norm();
-    // if xDir is degenerate (near-zero), build an arbitrary tangent frame from normal
-    // ex: normal=(0,1,0) -> pick tangentX=(1,0,0), Gram-Schmidt -> tangentX stays (1,0,0)
-    //     normal=(1,0,0) -> pick tangentX=(0,1,0), Gram-Schmidt -> tangentX stays (0,1,0)
-    if (tangentX.len() < 0.5) {
-        tangentX = (std::abs(normal.x) < 0.9) ? Vec3 { 1, 0, 0 } : Vec3 { 0, 1, 0 };
-        // Gram-Schmidt: remove the component of tangentX along normal to guarantee perpendicularity
-        // ex: tangentX=(1,0,0), normal=(0.6,0.8,0) -> tangentX -= 0.6*(0.6,0.8,0) = (0.64,-0.48,0), then normalized
-        tangentX = (tangentX - normal * tangentX.dot(normal)).norm();
-    }
-    // tangentY completes the right-hand orthonormal frame (tangentX, tangentY, normal)
-    // ex: normal=(0,0,1), tangentX=(1,0,0) -> tangentY = (0,0,1) x (1,0,0) = (0,1,0)
-    Vec3 tangentY = normal.cross(tangentX).norm();
-
-    // separate outer and inner (hole) loops
-    BoundaryLoop* outerLoop = nullptr;
-    std::vector<BoundaryLoop*> innerLoops;
-    for (auto& loop : loops) {
-        if (loop.isOuter)
-            outerLoop = &loop;
-        else
-            innerLoops.push_back(&loop);
-    }
-    if (!outerLoop && !loops.empty()) {
-        // fallback: treat largest-area loop as outer (STEP files occasionally mislabel)
-        double bestArea = -std::numeric_limits<double>::max();
-        for (auto& loop : loops) {
-            std::vector<Vec2> projected;
-            Vec3 centroid = { 0, 0, 0 };
-            for (auto& point : loop.points)
-                centroid = centroid + point;
-            centroid = centroid * (1.0 / loop.points.size());
-            for (auto& point : loop.points) {
-                Vec3 delta = point - centroid;
-                projected.push_back({ delta.dot(tangentX), delta.dot(tangentY) });
-            }
-            double loopArea = std::abs(area2D(projected));
-            if (loopArea > bestArea) {
-                bestArea = loopArea;
-                outerLoop = &loop;
-            }
-        }
-    }
-    if (!outerLoop)
-        return face;
-
-    // compute centroid of all loop points as the 2D projection origin
-    // centering the 2D coords reduces floating-point error in the ear-clipper
-    // (coords near zero rather than at large absolute positions like 150.003)
-    Vec3 centroid = { 0, 0, 0 };
-    int pointCount = 0;
-    for (auto& loop : loops)
-        for (auto& point : loop.points) {
-            centroid = centroid + point;
-            pointCount++;
-        }
-    if (pointCount)
-        centroid = centroid * (1.0 / pointCount);
-
-    // project 3D loop points onto the plane's local (tangentX, tangentY) tangent frame
-    // ex: point=(3,0,1), centroid=(1,0,1), tangentX=(1,0,0), tangentY=(0,1,0) -> u=2, v=0
-    auto projectTo2D = [&](std::vector<Vec3>& points3D) -> std::vector<Vec2> {
-        std::vector<Vec2> projected;
-        for (auto& point : points3D) {
-            Vec3 delta = point - centroid;
-            projected.push_back({ delta.dot(tangentX), delta.dot(tangentY) });
-        }
-        return projected;
-    };
-
-    // build outer and hole 2D polygons
-    std::vector<Vec2> outerPoly = projectTo2D(outerLoop->points);
-    // ensure outer polygon is CCW, the GPU uses this to determine which side of a triangle is the front face,
-    // if you mix them up, normals point the wrong way and faces disappear or are lit backwards
-    // the ear-clipper must work in a consistent winding, and hole boundaries must be wound opposite to the outer boundary so the algorithm can tell them apart
-    // ex: area2D = -5 -> polygon is CW -> reverse to make it CCW
-    if (area2D(outerPoly) < 0) {
-        std::reverse(outerPoly.begin(), outerPoly.end());
-        std::reverse(outerLoop->points.begin(), outerLoop->points.end());
-        outerPoly = projectTo2D(outerLoop->points);
-    }
-
-    std::vector<std::vector<Vec2>> holePolygons;
-    for (auto* innerLoop : innerLoops) {
-        auto holePoly = projectTo2D(innerLoop->points);
-        // holes must be CW (opposite winding to outer)
-        // ex: bolt hole boundary sampled CCW (area > 0) -> reverse to CW so bridge merge works correctly
-        if (area2D(holePoly) > 0) {
-            std::reverse(holePoly.begin(), holePoly.end());
-            std::reverse(innerLoop->points.begin(), innerLoop->points.end());
-            holePoly = projectTo2D(innerLoop->points);
-        }
-        holePolygons.push_back(holePoly);
-    }
-
-    // build merged polygon (O'Rourke bridge cuts, sorted rightmost-first)
-    // use merged polygon vertices DIRECTLY as GPU verts, reconstruct 3D from 2D
-    std::vector<Vec2> mergedPoly = buildMergedPolygon(outerPoly, holePolygons);
-    auto triangles = earClip(mergedPoly);
-    if (triangles.empty())
-        return face;
-
-    int mergedVertexCount = (int)mergedPoly.size();
-    // small offset along the normal to avoid z-fighting when two coplanar faces overlap
-    // ex: top cap of a cylinder sits flush against a flat face at the same Z -> offset by 0.0005 units
-    Vec3 offsetVec = normal * 5e-4;
-
-    // reconstruct 3D positions from 2D: pos3D = centroid + tangentX*u + tangentY*v
-    // ex: u=2, v=1, centroid=(0,0,5), tangentX=(1,0,0), tangentY=(0,1,0) -> pos3D=(2,1,5)
-    // emit front and back vertex sets with opposite normals for double-sided rendering
-    for (auto& vertex2D : mergedPoly) {
-        Vec3 pos3D = centroid + tangentX * vertex2D.u + tangentY * vertex2D.v;
-        appendVertex(face, pos3D + offsetVec, normal);
-    }
-    for (auto& vertex2D : mergedPoly) {
-        Vec3 pos3D = centroid + tangentX * vertex2D.u + tangentY * vertex2D.v;
-        appendVertex(face, pos3D + offsetVec, normal * -1.0);
-    }
-    for (auto& triangle : triangles)
-        appendTri(face, triangle[0], triangle[1], triangle[2]);
-    // reversed winding for back face
-    for (auto& triangle : triangles)
-        appendTri(face, triangle[0] + mergedVertexCount, triangle[2] + mergedVertexCount, triangle[1] + mergedVertexCount);
-    return face;
-}
-
-#pragma region advanced_face
-//  if outSurface non-null, the resolved surface is written out for callers that need the analytical definition after tessellation
-TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface)
-{
-    auto faceIt = map.find(faceId);
-    if (faceIt == map.end())
-        return {};
-    // ADVANCED_FACE params: (name, (bound_refs...), surface_ref, orientation_flag)
-    // ex: "('', (#200,#201), #202, .T.)" means no name, boundary is described by two loops (the outer rim and an inner hole, entities #200 and #201),
-    // underlying surface geometry is entity #202 (which might be a CYLINDRICAL_SURFACE)
-    // .T. (true) means the normal direction matches the surface's own normal (not flipped)
-    auto faceParams = splitTopLevel(faceIt->second.params);
-    if (faceParams.size() < 3)
-        return {};
-
-    // "what kind of surface is this and where is it in space"
-    Surface surface = resolveSurface(stepRef(faceParams[2]), map);
-    // orientation_flag ".F." means the face normal is opposite to the surface normal
-    // ex: inner wall of a hollow cylinder has ".F." so the normal points inward
-    bool faceReversed = (faceParams.size() >= 4 && trimWS(faceParams[3]) == ".F.");
-
-    if (outSurface)
-        *outSurface = surface;
-
-    // sample all boundary loops, converts the topological boundary description (a chain of edge references)
-    // into an actual ordered list of 3D points forming a closed polygon aka "what is the outline of this face"
-    std::vector<BoundaryLoop> loops;
-    for (auto& boundRef : splitTopLevel(unwrap(trimWS(faceParams[1])))) {
-        int boundId = stepRef(trimWS(boundRef));
-        BoundaryLoop loop = sampleLoop(boundId, map, arcSegs);
-        if (loop.points.size() >= 2)
-            loops.push_back(std::move(loop));
-    }
-
-    // takes the surface type + that outline and produces triangles = "how do I fill this face with geometry the GPU can render"
-    switch (surface.kind) {
-    case SurfaceKind::Cylinder:
-        return tessCylinder(surface, loops, arcSegs);
-    case SurfaceKind::Torus:
-        return tessTorus(surface, arcSegs, 24); // 24 tube segments is sufficient for fillet quality
-    case SurfaceKind::Plane:
-        return tessPlane(surface, loops, faceReversed);
-    default:
-        // unknown surface type, return empty rather than silently tessellating with the wrong model
-        return {};
-    }
-}
 #pragma region gpu upload
 // sums the area of all front-face triangles (first half of the index list, back-face duplicates are the second half)
 // exact for planar faces (ear-clip triangulates the exact boundary), approximate for curved surfaces (depends on arcSegs)
@@ -683,17 +639,17 @@ Mesh uploadMesh(const TessellatedFace& tessellatedFace)
 #pragma region geometry healing
 // retessellates the GPU mesh of a cylinder face with updated [heightMin, heightMax] and re-uploads it,
 // the CPU pickData is also replaced so ray picking and stats remain accurate
-void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double newHeightMax)
+void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax)
 {
-    const Surface& surf = model.faceSurfaces[cylIdx];
-    Vec3 origin = surf.axis.origin, Z = surf.axis.zDir.norm(), X = surf.axis.xDir.norm();
+    const Surface& surface = model.faceSurfaces[cylId];
+    Vec3 origin = surface.axis.origin, Z = surface.axis.zDir.norm(), X = surface.axis.xDir.norm();
     Vec3 Y = Z.cross(X).norm();
-    double radius = surf.majorRadius;
+    double radius = surface.majorRadius;
 
     // imagine a manual clock, each vertex is a clock stick, delta.dot(X)/delta.dot(Y) are already its (X,Y)
     // position on the clock face (= cos/sin of its angle), we never need to label it as "37 degrees"
     // just to sort it, we sort hands by position directly and only produce degree-labels at the very end
-    const TessellatedFace& oldFace = model.pickData[cylIdx];
+    const TessellatedFace& oldFace = model.pickData[cylId];
     int frontVertexCount = (int)oldFace.vertices.size() / 6;
     // read the clock stick, record each vertex as its (X,Y) position on the unit circle
     // (delta.dot(X)*invRadius, delta.dot(Y)*invRadius) = where the stick points on the clock face, no label (atan2) needed yet
@@ -768,11 +724,11 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
     TessellatedFace newFace = tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, newHeightMin, newHeightMax, 1);
 
     // unload the old GPU mesh and upload the new one
-    UnloadMesh(model.meshes[cylIdx]);
-    model.meshes[cylIdx] = uploadMesh(newFace);
-    model.pickData[cylIdx] = newFace;
-    model.faceAreas[cylIdx] = computeFaceArea(newFace);
-    model.cylHeightRanges[cylIdx] = { newHeightMin, newHeightMax };
+    UnloadMesh(model.meshes[cylId]);
+    model.meshes[cylId] = uploadMesh(newFace);
+    model.pickData[cylId] = newFace;
+    model.faceAreas[cylId] = computeFaceArea(newFace);
+    model.cylHeightRanges[cylId] = { newHeightMin, newHeightMax };
 }
 
 // checks if two faces share at least one vertex within eps (front-face vertices only)
@@ -782,7 +738,7 @@ void retessCylinderFace(CadModel& model, int cylIdx, double newHeightMin, double
 // back vertices are always exactly as many as front and stored contiguously after them (tessGrid and tessPlane both emit front then back),
 // so front_vertex_count = vertices.size()/3 / 2 = vertices.size()/6, base = i*3 then addresses XYZ within the front half only
 // if this invariant ever breaks, planeCount/cylCount will be wrong
-static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.05f)
+static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.1f)
 {
     int planeCount = (int)planeData.vertices.size() / 6;
     int cylCount = (int)cylData.vertices.size() / 6;
@@ -812,26 +768,26 @@ static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff,
 // builds the heal cache for the selected plane face at gesture start (rising edge of the translation)
 // scans all cylinders once, checks axis alignment and vertex adjacency at the current (initial) position,
 // records which cap each connected cylinder should extend so per-frame updates need no proximity work at all
-std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceIdx)
+std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceId)
 {
     std::vector<CylinderHealEntry> cache;
-    if (planeFaceIdx < 0 || planeFaceIdx >= (int)model.faceSurfaces.size())
+    if (planeFaceId < 0 || planeFaceId >= (int)model.faceSurfaces.size())
         return cache;
-    const Surface& planeSurf = model.faceSurfaces[planeFaceIdx];
+    const Surface& planeSurf = model.faceSurfaces[planeFaceId];
     if (planeSurf.kind != SurfaceKind::Plane)
         return cache;
 
     Vec3 planeNormal = planeSurf.axis.zDir.norm();
-    const Vector3& planeOff = model.faceOffsets[planeFaceIdx];
+    const Vector3& planeOff = model.faceOffsets[planeFaceId];
 
     // compute plane centroid in STEP space once (no offset, raw vertex data)
     Vec3 planeCent = { 0, 0, 0 };
-    int planeCount = (int)model.pickData[planeFaceIdx].vertices.size() / 6;
+    int planeCount = (int)model.pickData[planeFaceId].vertices.size() / 6;
     for (int vi = 0; vi < planeCount; vi++) {
         int base = vi * 3;
-        planeCent.x += model.pickData[planeFaceIdx].vertices[base];
-        planeCent.y += model.pickData[planeFaceIdx].vertices[base + 1];
-        planeCent.z += model.pickData[planeFaceIdx].vertices[base + 2];
+        planeCent.x += model.pickData[planeFaceId].vertices[base];
+        planeCent.y += model.pickData[planeFaceId].vertices[base + 1];
+        planeCent.z += model.pickData[planeFaceId].vertices[base + 2];
     }
     if (planeCount > 0) {
         double inv = 1.0 / planeCount;
@@ -850,7 +806,7 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
             continue;
 
         // adjacency check done here once at gesture start, plane is still at its initial position
-        if (!facesShareVertex(model.pickData[planeFaceIdx], planeOff, model.pickData[ci], model.faceOffsets[ci]))
+        if (!facesShareVertex(model.pickData[planeFaceId], planeOff, model.pickData[ci], model.faceOffsets[ci]))
             continue;
 
         // determine cap by projecting the plane centroid (raw STEP position + current draw-space offset) onto the
@@ -878,7 +834,7 @@ void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cac
         return;
     for (auto& entry : cache) {
         double signedDelta = axialDelta * entry.axisDotNormal;
-        CylinderHeightRange& chr = model.cylHeightRanges[entry.cylFaceIdx];
+        CylinderHeightRange& chr = model.cylHeightRanges[entry.cylFaceId];
         double newHeightMin = chr.heightMin, newHeightMax = chr.heightMax;
         if (entry.isMaxCap)
             newHeightMax = chr.heightMax + signedDelta;
@@ -889,6 +845,56 @@ void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cac
             std::swap(newHeightMin, newHeightMax);
             entry.isMaxCap = !entry.isMaxCap;
         }
-        retessCylinderFace(model, entry.cylFaceIdx, newHeightMin, newHeightMax);
+        retessCylinderFace(model, entry.cylFaceId, newHeightMin, newHeightMax);
+    }
+}
+
+#pragma region tessellate face
+TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface)
+{
+    auto faceIt = map.find(faceId);
+    if (faceIt == map.end())
+        return {};
+    // ADVANCED_FACE params: (name, (bound_refs...), surface_ref, orientation_flag)
+    // ex: "( 'NONE', ( #1565, #837, #1004, #1757, #2982, #765 ), #2444, .T. )" means
+    // - boundary is described by 6 refs, for our LeadScrew this corresponds to the 2 big faces with 1 outer edge + 4 inner edges for toruses
+    // + 1 inner edge for main hole = 6, 2 others have 2 refs because they're the ring at the start/end, and all the others have 1 ref because they're
+    // continuous shapes with no hole (only "outer" edge, even if cylinder or torus)
+    // - underlying surface geometry is entity #202 (here a plane)
+    // - .T. (true) means the normal direction matches the surface's own normal (not flipped)
+    auto faceParams = splitTopLevel(faceIt->second.params);
+    if (faceParams.size() < 3)
+        return {};
+
+    // "what kind of surface is this and where is it in space"
+    Surface surface = resolveSurface(stepRef(faceParams[2]), map);
+    // orientation_flag ".F." means the face normal is opposite to the surface normal
+    // ex: inner wall of a hollow cylinder has ".F." so the normal points inward
+    bool faceReversed = (faceParams.size() >= 4 && trimWS(faceParams[3]) == ".F.");
+
+    if (outSurface)
+        *outSurface = surface; // for callers thatwant it after
+
+    // sample all boundary loops, converts the topological boundary description (a chain of edge references)
+    // into an actual ordered list of 3D points forming a closed polygon aka "what is the outline of this face"
+    std::vector<BoundaryLoop> loops;
+    for (auto& boundRef : splitTopLevel(unwrap(trimWS(faceParams[1])))) {
+        int boundId = stepRef(trimWS(boundRef));
+        BoundaryLoop loop = sampleLoop(boundId, map, arcSegs);
+        if (loop.points.size() >= 2)
+            loops.push_back(std::move(loop));
+    }
+
+    // takes the surface type + that outline and produces triangles = "how do I fill this face with triangles the GPU can render"
+    switch (surface.kind) {
+    case SurfaceKind::Plane:
+        return tessPlane(surface, loops, faceReversed);
+    case SurfaceKind::Cylinder:
+        return tessCylinder(surface, loops, arcSegs);
+    case SurfaceKind::Torus:
+        return tessTorus(surface, arcSegs, arcSegs / 2);
+    default:
+        // unknown surface type, return empty rather than silently tessellating with the wrong model
+        return {};
     }
 }
