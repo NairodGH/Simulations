@@ -118,16 +118,16 @@ Vec3 resolvePoint(int id, const StepMap& map)
 {
     auto entityIt = map.find(id);
     if (entityIt == map.end())
-        return {};
+        throw std::runtime_error("CARTESIAN_POINT/DIRECTION missing at #" + std::to_string(id));
     auto params = splitTopLevel(entityIt->second.params);
     // CARTESIAN_POINT params: (name, (x,y,z))
     // params[0] = name string (ex: "''"), params[1] = coordinate tuple "(1.0,2.0,3.0)"
     if (params.size() < 2)
-        return {};
+        throw std::runtime_error("CARTESIAN_POINT missing coords at #" + std::to_string(id));
     // unwrap "(1.0,2.0,3.0)" -> "1.0,2.0,3.0", then split to ["1.0","2.0","3.0"]
     auto coords = splitTopLevel(unwrap(trimWS(params[1])));
     if (coords.size() < 3)
-        return {};
+        throw std::runtime_error("CARTESIAN_POINT has fewer than 3 coords at #" + std::to_string(id));
     return { dbl(coords[0]), dbl(coords[1]), dbl(coords[2]) };
 }
 
@@ -135,16 +135,16 @@ AxisPlacement resolveAxis(int id, const StepMap& map)
 {
     auto entityIt = map.find(id);
     if (entityIt == map.end())
-        return {};
+        throw std::runtime_error("AXIS2_PLACEMENT_3D missing at #" + std::to_string(id));
     // AXIS2_PLACEMENT_3D params: (name, origin_ref, z_dir_ref, x_dir_ref)
     // z and x direction refs point to DIRECTION entities (which share the CARTESIAN_POINT layout)
     // ex: "('', #10, #11, #12)" -> origin=point[10], zDir=point[11], xDir=point[12]
     auto params = splitTopLevel(entityIt->second.params);
+    if (params.size() < 3)
+        throw std::runtime_error("AXIS2_PLACEMENT_3D missing params at #" + std::to_string(id));
     AxisPlacement axis;
-    if (params.size() >= 2)
-        axis.origin = resolvePoint(stepRef(params[1]), map);
-    if (params.size() >= 3)
-        axis.zDir = resolvePoint(stepRef(params[2]), map);
+    axis.origin = resolvePoint(stepRef(params[1]), map);
+    axis.zDir = resolvePoint(stepRef(params[2]), map);
     if (params.size() >= 4)
         axis.xDir = resolvePoint(stepRef(params[3]), map);
     return axis;
@@ -161,27 +161,29 @@ Surface resolveSurface(int id, const StepMap& map)
         surface.kind = SurfaceKind::Plane;
         // PLANE params: (name, axis_placement_ref)
         // ex: "('flat_top', #20)" -> axis from entity #20
-        if (params.size() >= 2)
-            surface.axis = resolveAxis(stepRef(params[1]), map);
+        if (params.size() < 2)
+            throw std::runtime_error("PLANE missing axis ref at #" + std::to_string(id));
+        surface.axis = resolveAxis(stepRef(params[1]), map);
     } else if (entityIt->second.type == "CYLINDRICAL_SURFACE") {
         surface.kind = SurfaceKind::Cylinder;
         // CYLINDRICAL_SURFACE params: (name, axis_placement_ref, radius)
         // ex: "('', #30, 5.0)" -> axis from #30, radius = 5.0
-        if (params.size() >= 2)
-            surface.axis = resolveAxis(stepRef(params[1]), map);
-        if (params.size() >= 3)
-            surface.majorRadius = dbl(params[2]);
+        if (params.size() < 3)
+            throw std::runtime_error("CYLINDRICAL_SURFACE missing params at #" + std::to_string(id));
+        surface.axis = resolveAxis(stepRef(params[1]), map);
+        surface.majorRadius = dbl(params[2]);
     } else if (entityIt->second.type == "TOROIDAL_SURFACE") {
         surface.kind = SurfaceKind::Torus;
         // TOROIDAL_SURFACE params: (name, axis_placement_ref, major_radius, minor_radius)
         // ex: "('', #40, 10.0, 2.0)" -> fillet ring: center-circle R=10, tube r=2
-        if (params.size() >= 2)
-            surface.axis = resolveAxis(stepRef(params[1]), map);
-        if (params.size() >= 3)
-            surface.majorRadius = dbl(params[2]);
-        if (params.size() >= 4)
-            surface.minorRadius = dbl(params[3]);
+        if (params.size() < 4)
+            throw std::runtime_error("TOROIDAL_SURFACE missing params at #" + std::to_string(id));
+        surface.axis = resolveAxis(stepRef(params[1]), map);
+        surface.majorRadius = dbl(params[2]);
+        surface.minorRadius = dbl(params[3]);
     }
+    // unsupported surface types (B_SPLINE_SURFACE, ...) fall through with SurfaceKind::Unknown,
+    // tessellateAdvancedFace returns {} for unknown kinds and the face is skipped silently
     return surface;
 }
 
@@ -360,7 +362,7 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
             }
         return localPoints[degree];
     };
-    // ask for the final mixed color at segs+1 evenly spaced positions along the row of pots, from the first pot to the last,
+    // ask for the final mixed color at arcSegs+1 evenly spaced positions along the row of pots, from the first pot to the last,
     // and collecting all those colors into a list, that list is the polyline approximating the curve
     std::vector<Vec3> points;
     points.reserve(arcSegs + 1);
@@ -390,15 +392,15 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
     // ex: "( 'NONE', #318, .T. )" -> EDGE_LOOP is entity #318 (orientation is "edge loop runs clockwise or counterclockwise" but we don't care yet)
     auto boundParams = splitTopLevel(boundIt->second.params);
     if (boundParams.size() < 2)
-        throw std::runtime_error("FACE_BOUND missing params at #" + std::to_string(stepRef(boundParams[1])));
+        throw std::runtime_error("FACE_BOUND missing params at #" + std::to_string(boundId));
     auto loopIt = map.find(stepRef(boundParams[1]));
     if (loopIt == map.end() || loopIt->second.type != "EDGE_LOOP") // ref should always lead to EDGE_LOOP
         throw std::runtime_error("EDGE_LOOP missing at #" + std::to_string(stepRef(boundParams[1])));
     // EDGE_LOOP params: (name, (oriented_edge_ref, ...))
     // ex: "( 'NONE', ( #2513, #123 ) )" -> 2 oriented edges ("edges" aren't necessarily only 2 points,
-    // for a circle we could have 2 loops ach handle 180° of it for example)
+    // for a circle we could have 2 loops each handle 180° of it for example)
     auto loopParams = splitTopLevel(loopIt->second.params);
-    if (loopParams.size() < 2) // should always have 2 params
+    if (loopParams.size() < 2)
         throw std::runtime_error("EDGE_LOOP missing params at #" + std::to_string(stepRef(boundParams[1])));
 
     // since EDGE_LOOP has multiple refs, start looping through each

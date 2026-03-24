@@ -497,7 +497,19 @@ TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v
     return face;
 }
 
-static TessellatedFace tessCylinder(const Surface& surface, const std::vector<BoundaryLoop>& loops, int uSegments)
+// shared cylinder surface evaluation, reused by both tessCylinder and retessCylinderFace so the math lives in one place
+// positionFn: origin + radius*(cos(u)*X + sin(u)*Y) + v*Z, same formula sampleCircle uses for boundary arcs
+// normalFn: outward radial direction (same for all v at a given u), ex: u=0 -> (1,0,0), u=pi/2 -> (0,1,0)
+static auto cylPositionFn(Vec3 origin, Vec3 X, Vec3 Y, Vec3 Z, double radius)
+{
+    return [=](double u, double v) -> Vec3 { return origin + (X * std::cos(u) + Y * std::sin(u)) * radius + Z * v; };
+}
+static auto cylNormalFn(Vec3 X, Vec3 Y)
+{
+    return [=](double u, [[maybe_unused]] double v) -> Vec3 { return X * std::cos(u) + Y * std::sin(u); };
+}
+
+static TessellatedFace tessCylinder(const Surface& surface, const std::vector<BoundaryLoop>& loops, int uSegments, CylinderHeightRange* outHeightRange = nullptr)
 {
     Vec3 origin = surface.axis.origin, Z = surface.axis.zDir.norm(), X = surface.axis.xDir.norm();
     // Y = Z x X gives the third axis of the local coordinate frame (right-hand rule)
@@ -505,7 +517,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
     Vec3 Y = Z.cross(X).norm();
     double radius = surface.majorRadius;
 
-    // compute height range [heightMin, heightMax] by projecting all boundary points onto the cylinder axis, same as done in loadStep
+    // compute height range [heightMin, heightMax] by projecting all boundary points onto the cylinder axis
     // ex: screw shank with top boundary at h=10 and bottom at h=0 -> heightMin=0, heightMax=10
     double heightMin = std::numeric_limits<double>::max(), heightMax = -std::numeric_limits<double>::max();
     bool fullRevolution = false;
@@ -520,6 +532,9 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
     }
     if (heightMax - heightMin < 1e-8)
         return {};
+    // pass height range back to the caller so loadStep doesn't need to recompute it from vertices
+    if (outHeightRange)
+        *outHeightRange = { heightMin, heightMax };
 
     // angle range, full revolution or derive from boundary points
     double angleMin = 0, angleMax = 2 * M_PI;
@@ -535,7 +550,7 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
                 rawAngleMin = std::min(rawAngleMin, angle);
                 rawAngleMax = std::max(rawAngleMax, angle);
             }
-        // if the arc span covers almost the full circle, treat as full revolution  to avoid the gap caused by atan2 wrapping near +-pi
+        // if the arc span covers almost the full circle, treat as full revolution to avoid the gap caused by atan2 wrapping near +-pi
         // ex: rawAngleMin=-3.1, rawAngleMax=3.1 -> span=6.2 > 1.9*pi=5.97 -> full revolution
         if (rawAngleMax - rawAngleMin > 1.9 * M_PI) {
             angleMin = 0;
@@ -549,16 +564,8 @@ static TessellatedFace tessCylinder(const Surface& surface, const std::vector<Bo
         uCount = std::max(2, (int)(uSegments * (angleMax - angleMin) / (2 * M_PI)));
     }
 
-    // cylinder surface: positionFn(u,v) = origin + radius*(cos(u)*X + sin(u)*Y) + v*Z
-    // u = angle around axis [angleMin to angleMax], v = height along axis [heightMin to heightMax]
-    // TODO: we already do such computations in samplecircle, maybe there could be a cleaner refactor than doing it a 2nd time here
-    auto positionFn = [&](double u, double v) -> Vec3 {
-        Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
-        return origin + radialDir * radius + Z * v;
-    };
-    // outward radial direction (same for all v at a given u),  ex: u=0 -> normal=(1,0,0);  u=pi/2 -> normal=(0,1,0)
-    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 { return (X * std::cos(u) + Y * std::sin(u)); };
-    return tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, heightMin, heightMax, 1);
+    // cylinder surface: u = angle around axis, v = height along axis
+    return tessGrid(SurfaceKind::Cylinder, cylPositionFn(origin, X, Y, Z, radius), cylNormalFn(X, Y), angleMin, angleMax, uCount, heightMin, heightMax, 1);
 }
 
 static TessellatedFace tessTorus(const Surface& surface, int uSegments, int vSegments = 24)
@@ -691,11 +698,8 @@ void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double 
     // frontVertexCount = (uCount+1) * (1+1), so uCount = frontVertexCount/2 - 1
     int uCount = std::max(2, frontVertexCount / 2 - 1);
 
-    auto positionFn = [&](double u, double v) -> Vec3 {
-        Vec3 radialDir = X * std::cos(u) + Y * std::sin(u);
-        return origin + radialDir * radius + Z * v;
-    };
-    auto normalFn = [&](double u, [[maybe_unused]] double v) -> Vec3 { return (X * std::cos(u) + Y * std::sin(u)); };
+    auto positionFn = cylPositionFn(origin, X, Y, Z, radius);
+    auto normalFn = cylNormalFn(X, Y);
     TessellatedFace newFace = tessGrid(SurfaceKind::Cylinder, positionFn, normalFn, angleMin, angleMax, uCount, newHeightMin, newHeightMax, 1);
 
     // unload the old GPU mesh and upload the new one
@@ -824,7 +828,7 @@ void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cac
 }
 
 #pragma region tessellate face
-TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface)
+TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface, CylinderHeightRange* outHeightRange)
 {
     auto faceIt = map.find(faceId);
     if (faceIt == map.end())
@@ -864,7 +868,7 @@ TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSe
     case SurfaceKind::Plane:
         return tessPlane(surface, loops, faceReversed);
     case SurfaceKind::Cylinder:
-        return tessCylinder(surface, loops, arcSegs);
+        return tessCylinder(surface, loops, arcSegs, outHeightRange);
     case SurfaceKind::Torus:
         return tessTorus(surface, arcSegs, arcSegs / 2);
     default:

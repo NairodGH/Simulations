@@ -371,12 +371,12 @@ static float computeFaceMinDistance(
     return sqrtf(minDistSq);
 }
 
-// draws the whole model bounding box (centered at origin to match drawCadModel) in gold
-// recomputed each call to reflect any per-face offsets accumulated since load
-static void drawModelBbox(const CadModel& model)
+// computes the AABB of all faces in draw space (vertices minus center plus their current offsets),
+// used for both the live model bbox display and the per-face bbox display
+// pass center={0,0,0} and a single face's offset to get a per-face bbox, or modelCenter() and per-face offsets for the full model
+static BoundingBox computeModelBBox(const CadModel& model, Vector3 center)
 {
-    Vector3 center = modelCenter(model);
-    BoundingBox dynamicBbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
+    BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
         { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
     for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
         const auto& face = model.pickData[fi];
@@ -387,15 +387,21 @@ static void drawModelBbox(const CadModel& model)
             float x = face.vertices[base] - center.x + off.x;
             float y = face.vertices[base + 1] - center.y + off.y;
             float z = face.vertices[base + 2] - center.z + off.z;
-            dynamicBbox.min.x = std::min(dynamicBbox.min.x, x);
-            dynamicBbox.max.x = std::max(dynamicBbox.max.x, x);
-            dynamicBbox.min.y = std::min(dynamicBbox.min.y, y);
-            dynamicBbox.max.y = std::max(dynamicBbox.max.y, y);
-            dynamicBbox.min.z = std::min(dynamicBbox.min.z, z);
-            dynamicBbox.max.z = std::max(dynamicBbox.max.z, z);
+            bbox.min.x = std::min(bbox.min.x, x);
+            bbox.max.x = std::max(bbox.max.x, x);
+            bbox.min.y = std::min(bbox.min.y, y);
+            bbox.max.y = std::max(bbox.max.y, y);
+            bbox.min.z = std::min(bbox.min.z, z);
+            bbox.max.z = std::max(bbox.max.z, z);
         }
     }
-    DrawBoundingBox(dynamicBbox, GOLD);
+    return bbox;
+}
+
+// draws the whole model bounding box in gold, recomputed each call to reflect current face offsets
+static void drawModelBbox(const CadModel& model)
+{
+    DrawBoundingBox(computeModelBBox(model, modelCenter(model)), GOLD);
 }
 
 // draws the bounding box of the selected face in orange, for planes this will be a flat rectangle, for cylinders/toruses a proper 3D box
@@ -403,8 +409,7 @@ static void drawFaceBbox(const CadModel& model)
 {
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
         return;
-    Vector3 center = modelCenter(model);
-    DrawBoundingBox(computeFaceBBox(model.pickData[model.selectedFace], center, model.faceOffsets[model.selectedFace]), ORANGE);
+    DrawBoundingBox(computeFaceBBox(model.pickData[model.selectedFace], modelCenter(model), model.faceOffsets[model.selectedFace]), ORANGE);
 }
 
 // draws small yellow outward normal arrows per triangle of the selected face (front-face triangles only, strided to avoid clutter)
@@ -489,31 +494,6 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
     }
 }
 
-// computes live model bbox across all faces including their current offsets, in STEP space (not draw space)
-static BoundingBox computeLiveModelBBox(const CadModel& model)
-{
-    BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
-        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
-    for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
-        const auto& face = model.pickData[fi];
-        Vector3 off = model.faceOffsets[fi];
-        int frontVertexCount = (int)face.vertices.size() / 6;
-        for (int i = 0; i < frontVertexCount; i++) {
-            int base = i * 3;
-            float x = face.vertices[base] + off.x;
-            float y = face.vertices[base + 1] + off.y;
-            float z = face.vertices[base + 2] + off.z;
-            bbox.min.x = std::min(bbox.min.x, x);
-            bbox.max.x = std::max(bbox.max.x, x);
-            bbox.min.y = std::min(bbox.min.y, y);
-            bbox.max.y = std::max(bbox.max.y, y);
-            bbox.min.z = std::min(bbox.min.z, z);
-            bbox.max.z = std::max(bbox.max.z, z);
-        }
-    }
-    return bbox;
-}
-
 // draws the area-weighted average orientation of all faces as a SKYBLUE arrow from the live model center
 // each face contributes its zDir (plane normal / cylinder+torus axis) weighted by its tessellated area
 static void drawModelAverageNormal(const CadModel& model, float scale)
@@ -527,10 +507,10 @@ static void drawModelAverageNormal(const CadModel& model, float scale)
     Vec3 avgNormal = weightedSum.norm();
     // anchor at the live bbox center in draw space (live center minus the static centering offset)
     // as faces are push/pulled the live center drifts, keeping the arrow visually attached to the actual model centroid
-    BoundingBox liveBbox = computeLiveModelBBox(model);
     Vector3 staticCenter = modelCenter(model);
-    Vector3 origin3D = { (liveBbox.min.x + liveBbox.max.x) * 0.5f - staticCenter.x, (liveBbox.min.y + liveBbox.max.y) * 0.5f - staticCenter.y,
-        (liveBbox.min.z + liveBbox.max.z) * 0.5f - staticCenter.z };
+    BoundingBox liveBbox = computeModelBBox(model, staticCenter);
+    Vector3 origin3D = { (liveBbox.min.x + liveBbox.max.x) * 0.5f, (liveBbox.min.y + liveBbox.max.y) * 0.5f,
+        (liveBbox.min.z + liveBbox.max.z) * 0.5f };
     Vector3 tip = { origin3D.x + (float)avgNormal.x * scale, origin3D.y + (float)avgNormal.y * scale, origin3D.z + (float)avgNormal.z * scale };
     DrawLine3D(origin3D, tip, SKYBLUE);
 }
@@ -904,14 +884,14 @@ static void drawUI(const CadModel& model)
     DrawText(TextFormat("Faces: %d\nTriangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, paleLime);
     uiY += uiStep * 2; // two lines because of the \n
 
-    BoundingBox liveBbox = computeLiveModelBBox(model);
     Vector3 mCenter = modelCenter(model);
+    BoundingBox liveBbox = computeModelBBox(model, mCenter);
     DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", liveBbox.max.x - liveBbox.min.x, liveBbox.max.y - liveBbox.min.y,
                  liveBbox.max.z - liveBbox.min.z),
         20, uiY, 16, paleLime);
     uiY += uiStep * 3;
-    DrawText(TextFormat("Position: %.2f %.2f %.2f", (liveBbox.min.x + liveBbox.max.x) * 0.5f - mCenter.x, (liveBbox.min.y + liveBbox.max.y) * 0.5f - mCenter.y,
-                 (liveBbox.min.z + liveBbox.max.z) * 0.5f - mCenter.z),
+    DrawText(TextFormat("Position: %.2f %.2f %.2f", (liveBbox.min.x + liveBbox.max.x) * 0.5f, (liveBbox.min.y + liveBbox.max.y) * 0.5f,
+                 (liveBbox.min.z + liveBbox.max.z) * 0.5f),
         20, uiY, 16, paleLime);
     uiY += uiStep;
     DrawText("Drag = orbit", 20, uiY, 16, paleLime);
@@ -992,7 +972,8 @@ CadModel loadStep(const std::string& path, int arcSegs)
     // for each advanced face, by ID, go down its IDs nesting to resolve the face (shape) and add it to the model
     for (int faceId : faceIds) {
         Surface faceSurface;
-        TessellatedFace tessellatedFace = tessellateAdvancedFace(faceId, entityMap, arcSegs, &faceSurface);
+        CylinderHeightRange cylHeightRange;
+        TessellatedFace tessellatedFace = tessellateAdvancedFace(faceId, entityMap, arcSegs, &faceSurface, &cylHeightRange);
         if (tessellatedFace.indices.empty())
             continue;
         // expand the overall bounding box with all front-face vertices of this face
@@ -1017,21 +998,6 @@ CadModel loadStep(const std::string& path, int arcSegs)
         model.faceSurfaces.push_back(faceSurface);
         model.faceAreas.push_back(computeFaceArea(tessellatedFace));
         model.faceOffsets.push_back({ 0.0f, 0.0f, 0.0f });
-        // recover cylinder height range from its vertices using dot product
-        CylinderHeightRange cylHeightRange;
-        if (faceSurface.kind == SurfaceKind::Cylinder) {
-            Vec3 cylOrigin = faceSurface.axis.origin, cylZ = faceSurface.axis.zDir.norm();
-            cylHeightRange.heightMin = std::numeric_limits<double>::max();
-            cylHeightRange.heightMax = -std::numeric_limits<double>::max();
-            int frontVertexCount = (int)tessellatedFace.vertices.size() / 6;
-            for (int vertexId = 0; vertexId < frontVertexCount; vertexId++) {
-                int base = vertexId * 3;
-                Vec3 point = { tessellatedFace.vertices[base], tessellatedFace.vertices[base + 1], tessellatedFace.vertices[base + 2] };
-                double height = (point - cylOrigin).dot(cylZ);
-                cylHeightRange.heightMin = std::min(cylHeightRange.heightMin, height);
-                cylHeightRange.heightMax = std::max(cylHeightRange.heightMax, height);
-            }
-        }
         model.cylHeightRanges.push_back(cylHeightRange); // will be 0 for other shapes, still need to push for SoA
         model.totalTriangleCount += (int)(tessellatedFace.indices.size() / 6); // front triangles only
     }
@@ -1047,7 +1013,14 @@ int main()
 
     // executable either at root or in build/Release idk xd
     const std::string stepPath = std::filesystem::exists("cad/cad.step") ? "cad/cad.step" : "../../cad/cad.step";
-    CadModel model = loadStep(stepPath); //TODO: make the parsing side strong with throw guard that will get caught in a try catch here
+    CadModel model;
+    try {
+        model = loadStep(stepPath);
+    } catch (const std::runtime_error& e) {
+        TraceLog(LOG_ERROR, "STEP parse failed: %s", e.what());
+        CloseWindow();
+        return 1;
+    }
 
     Vector3 modelSize = { model.bbox.max.x - model.bbox.min.x, model.bbox.max.y - model.bbox.min.y, model.bbox.max.z - model.bbox.min.z };
     // diagonal of the bounding box, aka "diameter" from one corner to the opposite,
@@ -1075,7 +1048,13 @@ int main()
     while (!WindowShouldClose()) {
         // reload the model and reinitialise all camera and view state from scratch
         if (model.needsReset) {
-            model = loadStep(stepPath);
+            try {
+                model = loadStep(stepPath);
+            } catch (const std::runtime_error& e) {
+                TraceLog(LOG_ERROR, "STEP parse failed: %s", e.what());
+                CloseWindow();
+                return 1;
+            }
             modelSize = { model.bbox.max.x - model.bbox.min.x, model.bbox.max.y - model.bbox.min.y, model.bbox.max.z - model.bbox.min.z };
             diagonal = sqrtf(modelSize.x * modelSize.x + modelSize.y * modelSize.y + modelSize.z * modelSize.z);
             yaw = 45.0f;

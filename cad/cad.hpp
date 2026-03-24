@@ -159,9 +159,11 @@ struct CadModel {
     int secondFace = -1;
     bool needsReset = false; // "persistent" for 1 frame lmao
 
-    // load-time constants
-    BoundingBox bbox; // TODO: unified truth bbox
-    int totalTriangleCount = 0; // will never change, even for geometry healed cylinders because UV grid tesselation doesnt create new triangles
+    // load-time centering anchor set once during loadStep from raw STEP vertex positions (no offsets),
+    // used only to derive modelCenter() which is the fixed origin for all draw-space transforms,
+    // for the live extent including current face offsets use computeModelBBox()
+    BoundingBox bbox;
+    int totalTriangleCount = 0; // will never change, even for geometry healed cylinders because UV grid tessellation doesnt create new triangles
 
     // ok crazy stuff next (spent way too much searching for the problem): C++ Rule of Five says if you define any one of destructor, copy constructor, copy
     // assignment, move constructor or move assignment, you probably need to define all five because they're all related to the same question of "who owns
@@ -180,6 +182,10 @@ struct CadModel {
     ~CadModel();
 };
 
+// cad.cpp
+CadModel loadStep(const std::string& path, int arcSegs = 48);
+void drawCadModel(const CadModel& model);
+
 // parser utils
 std::vector<std::string> splitTopLevel(const std::string& input);
 std::string trimWS(const std::string& input);
@@ -187,21 +193,17 @@ std::string unwrap(const std::string& input);
 int stepRef(const std::string& input);
 double dbl(const std::string& input);
 
-// parser.cpp: STEP file parsing, entity resolution, curve sampling, boundary loop resolution
+// parser.cpp
 StepMap parseStepFile(const std::string& path);
 Vec3 resolvePoint(int id, const StepMap& map);
 AxisPlacement resolveAxis(int id, const StepMap& map);
 Surface resolveSurface(int id, const StepMap& map);
 BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs);
 
-// tessellator.cpp: UV grid, face tessellation, GPU upload, geometry healing
-TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr);
+// tessellator.cpp
+TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
 float computeFaceArea(const TessellatedFace& face);
 Mesh uploadMesh(const TessellatedFace& tessellatedFace);
 void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax);
 std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceId);
 void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cache, Vec3 planeNormal, Vector3 delta);
-
-// cad.cpp: model loading and drawing
-CadModel loadStep(const std::string& path, int arcSegs = 48);
-void drawCadModel(const CadModel& model);
