@@ -109,6 +109,11 @@ struct CylinderHealEntry {
     double axisDotNormal; // dot(cylAxis, planeNormal) = about 1, preserves sign for signedDelta each frame
 };
 
+struct CylFrameSnapshot {
+    CylinderHeightRange range;
+    bool isMaxCap;
+};
+
 enum class ConstraintKind { Distance, Symmetry };
 
 // one active constraint pairing between two faces
@@ -201,7 +206,8 @@ Surface resolveSurface(int id, const StepMap& map);
 BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs);
 
 // tessellator.cpp
-TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
+TessellatedFace tessellateAdvancedFace(
+    int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
 float computeFaceArea(const TessellatedFace& face);
 Mesh uploadMesh(const TessellatedFace& tessellatedFace);
 void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax);

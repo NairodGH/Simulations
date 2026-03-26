@@ -509,7 +509,8 @@ static auto cylNormalFn(Vec3 X, Vec3 Y)
     return [=](double u, [[maybe_unused]] double v) -> Vec3 { return X * std::cos(u) + Y * std::sin(u); };
 }
 
-static TessellatedFace tessCylinder(const Surface& surface, const std::vector<BoundaryLoop>& loops, int uSegments, CylinderHeightRange* outHeightRange = nullptr)
+static TessellatedFace tessCylinder(
+    const Surface& surface, const std::vector<BoundaryLoop>& loops, int uSegments, CylinderHeightRange* outHeightRange = nullptr)
 {
     Vec3 origin = surface.axis.origin, Z = surface.axis.zDir.norm(), X = surface.axis.xDir.norm();
     // Y = Z x X gives the third axis of the local coordinate frame (right-hand rule)
@@ -717,7 +718,7 @@ void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double 
 // back vertices are always exactly as many as front and stored contiguously after them (tessGrid and tessPlane both emit front then back),
 // so front_vertex_count = vertices.size()/3 / 2 = vertices.size()/6, base = i*3 then addresses XYZ within the front half only
 // if this invariant ever breaks, planeCount/cylCount will be wrong
-static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.1f)
+static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.05f)
 {
     int planeCount = (int)planeData.vertices.size() / 6;
     int cylCount = (int)cylData.vertices.size() / 6;
@@ -783,18 +784,31 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
         if (std::abs(dotVal) < 0.99)
             continue;
 
-        // adjacency check done here once at gesture start, plane is still at its initial position
-        if (!facesShareVertex(model.pickData[planeFaceId], planeOff, model.pickData[ci], model.faceOffsets[ci]))
-            continue;
-
-        // determine cap by projecting the plane centroid (raw STEP position + current draw-space offset) onto the
-        // cylinder axis, then comparing to the height midpoint, the offset must be included because a prior heal
-        // may have extended heightMax, shifting the midpoint so that the raw centroid alone would pick the wrong cap
+        // project the plane centroid (raw STEP position + current draw-space offset) onto the cylinder axis,
+        // the offset must be included because a prior heal may have extended heightMax, shifting the midpoint
         Vec3 toCent = { planeCent.x - cylSurf.axis.origin.x, planeCent.y - cylSurf.axis.origin.y, planeCent.z - cylSurf.axis.origin.z };
         double planeOffDot = planeOff.x * cylAxis.x + planeOff.y * cylAxis.y + planeOff.z * cylAxis.z;
         double planeProjH = toCent.dot(cylAxis) + planeOffDot;
         const CylinderHeightRange& chr = model.cylHeightRanges[ci];
-        bool isMaxCap = (planeProjH >= (chr.heightMin + chr.heightMax) * 0.5);
+
+        const double axialEps = 0.5;
+        if (std::abs(planeProjH - chr.heightMin) >= axialEps && std::abs(planeProjH - chr.heightMax) >= axialEps)
+            continue;
+
+        const double radialEps = 0.05;
+        bool anyVertexInCrossSection = false;
+        for (int vi = 0; vi < planeCount && !anyVertexInCrossSection; vi++) {
+            int base = vi * 3;
+            Vec3 toVert = { (double)model.pickData[planeFaceId].vertices[base] - cylSurf.axis.origin.x,
+                (double)model.pickData[planeFaceId].vertices[base + 1] - cylSurf.axis.origin.y,
+                (double)model.pickData[planeFaceId].vertices[base + 2] - cylSurf.axis.origin.z };
+            Vec3 radialVert = toVert - cylAxis * toVert.dot(cylAxis);
+            if (radialVert.len() <= cylSurf.majorRadius + radialEps)
+                anyVertexInCrossSection = true;
+        }
+        if (!anyVertexInCrossSection)
+            continue;
+        bool isMaxCap = (std::abs(planeProjH - chr.heightMax) <= std::abs(planeProjH - chr.heightMin));
 
         cache.push_back({ ci, isMaxCap, dotVal });
     }
@@ -819,7 +833,7 @@ void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cac
         else
             newHeightMin = chr.heightMin + signedDelta;
         // ex: plane pushes top cap down past the bottom -> range [0,5] becomes [5,0] -> swap to [0,5] reflected, flip cap
-        if (newHeightMax < newHeightMin) {
+        if (newHeightMax <= newHeightMin + 1e-6) {
             std::swap(newHeightMin, newHeightMax);
             entry.isMaxCap = !entry.isMaxCap;
         }

@@ -82,17 +82,37 @@ static std::vector<std::pair<int, Vector3>> collectConstrainedMoves(const CadMod
     return queue;
 }
 
-// clamps the axial component of delta to zero for any pair directly on movingFace where both Distance
-// and Symmetry are active (because that combination fully locks the axis on that pair)
+// clamps the axial component of delta to zero if any pair anywhere in the reachable constraint graph has
+// both Distance and Symmetry active (because that combination fully locks the axis for the entire chain,
+// ex: face3-D-face2-S+D-face1 -> moving face3 is still locked because the S+D pair is reachable from it)
 // returns true if any clamping was applied so the caller can show a toast on the gesture rising edge
 static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vector3& delta)
 {
+    // walk the full reachable constraint graph from movingFace (same BFS as collectConstrainedMoves)
+    std::vector<int> queue = { movingFace };
+    std::vector<int> visited = { movingFace };
+    int workId = 0;
+    while (workId < (int)queue.size()) {
+        int currentFace = queue[workId++];
+        for (const auto& cp : model.constraints) {
+            if (cp.faceA != currentFace && cp.faceB != currentFace)
+                continue;
+            int otherFace = (cp.faceA == currentFace) ? cp.faceB : cp.faceA;
+            if (std::find(visited.begin(), visited.end(), otherFace) != visited.end())
+                continue;
+            visited.push_back(otherFace);
+            queue.push_back(otherFace);
+        }
+    }
+    // check every pair whose both endpoints are in the reachable set for S+D
     bool clamped = false;
     for (const auto& cp : model.constraints) {
-        if (cp.faceA != movingFace && cp.faceB != movingFace)
-            continue; // get to a pair that involves movingFace
         if (!cp.hasDistance || !cp.hasSymmetry)
-            continue; // if doesnt have both distance and symmetry dont bother
+            continue;
+        bool aReachable = std::find(visited.begin(), visited.end(), cp.faceA) != visited.end();
+        bool bReachable = std::find(visited.begin(), visited.end(), cp.faceB) != visited.end();
+        if (!aReachable || !bReachable)
+            continue; // pair is not part of the reachable chain
         Vec3 normal = model.faceSurfaces[cp.faceA].axis.zDir.norm();
         double axialScalar = normal.x * delta.x + normal.y * delta.y + normal.z * delta.z;
         if (std::abs(axialScalar) < 1e-8)
@@ -399,10 +419,7 @@ static BoundingBox computeModelBBox(const CadModel& model, Vector3 center)
 }
 
 // draws the whole model bounding box in gold, recomputed each call to reflect current face offsets
-static void drawModelBbox(const CadModel& model)
-{
-    DrawBoundingBox(computeModelBBox(model, modelCenter(model)), GOLD);
-}
+static void drawModelBbox(const CadModel& model) { DrawBoundingBox(computeModelBBox(model, modelCenter(model)), GOLD); }
 
 // draws the bounding box of the selected face in orange, for planes this will be a flat rectangle, for cylinders/toruses a proper 3D box
 static void drawFaceBbox(const CadModel& model)
@@ -509,8 +526,7 @@ static void drawModelAverageNormal(const CadModel& model, float scale)
     // as faces are push/pulled the live center drifts, keeping the arrow visually attached to the actual model centroid
     Vector3 staticCenter = modelCenter(model);
     BoundingBox liveBbox = computeModelBBox(model, staticCenter);
-    Vector3 origin3D = { (liveBbox.min.x + liveBbox.max.x) * 0.5f, (liveBbox.min.y + liveBbox.max.y) * 0.5f,
-        (liveBbox.min.z + liveBbox.max.z) * 0.5f };
+    Vector3 origin3D = { (liveBbox.min.x + liveBbox.max.x) * 0.5f, (liveBbox.min.y + liveBbox.max.y) * 0.5f, (liveBbox.min.z + liveBbox.max.z) * 0.5f };
     Vector3 tip = { origin3D.x + (float)avgNormal.x * scale, origin3D.y + (float)avgNormal.y * scale, origin3D.z + (float)avgNormal.z * scale };
     DrawLine3D(origin3D, tip, SKYBLUE);
 }
@@ -669,9 +685,81 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             off.x += delta.x;
             off.y += delta.y;
             off.z += delta.z;
-            applyCylinderHealCache(model, model.healCache, planeNormal, delta);
-            // propagate the delta to every face constrained to this one
-            propagateConstraints(model, model.selectedFace, delta);
+            // collect constrained moves once so we can reuse the derived deltas below without a second DFS
+            auto constrainedMoves = collectConstrainedMoves(model, model.selectedFace, delta);
+            std::unordered_map<int, CylFrameSnapshot> preFrame;
+            for (const auto& pe : model.healCache)
+                preFrame.emplace(pe.cylFaceId, CylFrameSnapshot { model.cylHeightRanges[pe.cylFaceId], pe.isMaxCap });
+            for (const auto& [cacheId, cacheEntries] : model.propagatedHealCaches)
+                for (const auto& qe : cacheEntries)
+                    preFrame.emplace(qe.cylFaceId, CylFrameSnapshot { model.cylHeightRanges[qe.cylFaceId], qe.isMaxCap });
+
+            double primaryAxialDelta = planeNormal.x * delta.x + planeNormal.y * delta.y + planeNormal.z * delta.z;
+
+            std::unordered_map<int, Vector3> propOds;
+            std::unordered_map<int, double> propAxialDeltas;
+            for (const auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
+                Vector3 od = { 0, 0, 0 };
+                for (const auto& [face, faceDelta] : constrainedMoves)
+                    if (face == cacheId) {
+                        od = faceDelta;
+                        break;
+                    }
+                propOds[cacheId] = od;
+                Vec3 partnerNormal = model.faceSurfaces[cacheId].axis.zDir.norm();
+                propAxialDeltas[cacheId] = partnerNormal.x * od.x + partnerNormal.y * od.y + partnerNormal.z * od.z;
+            }
+
+            for (auto& [cylId, snap] : preFrame) {
+                double newMin = snap.range.heightMin;
+                double newMax = snap.range.heightMax;
+                // primary cache contribution (at most one entry per cylinder)
+                for (auto& pe : model.healCache) {
+                    if (pe.cylFaceId != cylId)
+                        continue;
+                    double signedDelta = primaryAxialDelta * pe.axisDotNormal;
+                    if (pe.isMaxCap)
+                        newMax += signedDelta;
+                    else
+                        newMin += signedDelta;
+                    break;
+                }
+                for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
+                    double pad = propAxialDeltas.count(cacheId) ? propAxialDeltas.at(cacheId) : 0.0;
+                    for (auto& qe : cacheEntries) {
+                        if (qe.cylFaceId != cylId)
+                            continue;
+                        double signedDelta = pad * qe.axisDotNormal;
+                        if (qe.isMaxCap)
+                            newMax += signedDelta;
+                        else
+                            newMin += signedDelta;
+                        break; // each face owns at most one cap of a given cylinder
+                    }
+                }
+                if (newMax <= newMin + 1e-6) {
+                    std::swap(newMin, newMax);
+                    for (auto& pe : model.healCache)
+                        if (pe.cylFaceId == cylId) {
+                            pe.isMaxCap = !pe.isMaxCap;
+                            break;
+                        }
+                    for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches)
+                        for (auto& qe : cacheEntries)
+                            if (qe.cylFaceId == cylId) {
+                                qe.isMaxCap = !qe.isMaxCap;
+                                break;
+                            }
+                }
+                retessCylinderFace(model, cylId, newMin, newMax);
+            }
+
+            for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
+                const Vector3& od = propOds.count(cacheId) ? propOds.at(cacheId) : Vector3 { 0, 0, 0 };
+                model.faceOffsets[cacheId].x += od.x;
+                model.faceOffsets[cacheId].y += od.y;
+                model.faceOffsets[cacheId].z += od.z;
+            }
         };
         move(KEY_UP, zDir);
         move(KEY_DOWN, zDir * -1.0);
@@ -909,8 +997,8 @@ static void drawUI(const CadModel& model)
     if (model.selectedFace > -1) {
         int faceId = model.selectedFace;
         int frontTris = (int)model.pickData[faceId].indices.size() / 6;
-        DrawText(TextFormat("Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceId, nameForKind(model.pickData[faceId].kind), frontTris,
-                     model.faceAreas[faceId]),
+        DrawText(TextFormat(
+                     "Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceId, nameForKind(model.pickData[faceId].kind), frontTris, model.faceAreas[faceId]),
             20, uiY, 16, paleYellow);
         uiY += uiStep * 3;
 
@@ -1029,7 +1117,7 @@ int main()
 
     auto initCamera = [&]() {
         // default camera state, feel-tuned
-        Camera3D cam = {};
+        Camera3D cam = { };
         cam.target = { 0, 0, 0 }; // where it looks at (our model)
         cam.up = { 0, 1, 0 };
         cam.fovy = 45;
