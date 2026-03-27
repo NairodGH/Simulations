@@ -314,15 +314,14 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
                 allNumeric = false;
                 break;
             }
-            try {
-                candidates.push_back(std::stod(trimmedValue));
-            } catch (const std::invalid_argument&) {
-                allNumeric = false;
-                break;
-            } catch (const std::out_of_range&) {
+            // check the token looks like a number before calling dbl() so we don't confuse a parse failure (returns 0) with a genuine 0 knot
+            bool looksNumeric = !trimmedValue.empty()
+                && (std::isdigit((unsigned char)trimmedValue[0]) || trimmedValue[0] == '-' || trimmedValue[0] == '+' || trimmedValue[0] == '.');
+            if (!looksNumeric) {
                 allNumeric = false;
                 break;
             }
+            candidates.push_back(dbl(trimmedValue));
         }
         if (!allNumeric)
             continue;

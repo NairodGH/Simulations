@@ -1,15 +1,15 @@
 #include "cad.hpp"
 
 // appends a single vertex (position + normal) to the flat float arrays of a TessellatedFace
-// ex: pos=(1,0,0), nor=(1,0,0) -> pushes 6 floats: vertices=[...,1,0,0], normals=[...,1,0,0]
-static void appendVertex(TessellatedFace& face, Vec3 pos, Vec3 nor)
+// ex: pos=(1,0,0), normal=(1,0,0) -> pushes 6 floats: vertices=[...,1,0,0], normals=[...,1,0,0]
+static void appendVertex(TessellatedFace& face, Vec3 pos, Vec3 normal)
 {
     face.vertices.push_back((float)pos.x);
     face.vertices.push_back((float)pos.y);
     face.vertices.push_back((float)pos.z);
-    face.normals.push_back((float)nor.x);
-    face.normals.push_back((float)nor.y);
-    face.normals.push_back((float)nor.z);
+    face.normals.push_back((float)normal.x);
+    face.normals.push_back((float)normal.y);
+    face.normals.push_back((float)normal.z);
 }
 
 // appends a single triangle (three vertex indices) to the index list, ex: appendTri(face, 0, 1, 2) -> face.indices = [..., 0, 1, 2]
@@ -453,32 +453,35 @@ TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v
 {
     TessellatedFace face;
     face.kind = kind;
+    assert(uSteps > 0 && vSteps > 0); // so that we never ever divide by 0 later
     // row stride in the flat vertex array: one row = uSteps+1 vertices
     // ex: uSteps=3 -> stride=4; vertex at grid cell (ui=2, vId=1) is at flat index 1*4+2 = 6
     int stride = uSteps + 1;
 
-    // cache front-vertex positions so the back-vertex pass can reuse them without calling positionFn again
-    // (avoids duplicate sin/cos for cylinders and toruses which compute radial direction inside positionFn)
+    // cache front-vertex positions and normals so the back-vertex pass can reuse them without calling positionFn/normalFn again
+    // (avoids duplicate sin/cos for cylinders and toruses which compute radial direction inside both fns)
     std::vector<Vec3> frontPos;
     frontPos.reserve((uSteps + 1) * (vSteps + 1));
+    std::vector<Vec3> frontNormals;
+    frontNormals.reserve((uSteps + 1) * (vSteps + 1));
 
     // front vertices: grid of (uSteps+1)*(vSteps+1) points sampled at each (u,v)
     for (int vId = 0; vId <= vSteps; vId++)
         for (int uId = 0; uId <= uSteps; uId++) {
             double u = u0 + (u1 - u0) * (double)uId / uSteps, v = v0 + (v1 - v0) * (double)vId / vSteps;
             Vec3 pos = positionFn(u, v);
+            Vec3 normal = normalFn(u, v);
             frontPos.push_back(pos);
-            appendVertex(face, pos, normalFn(u, v));
+            frontNormals.push_back(normal);
+            appendVertex(face, pos, normal);
         }
     // frontVertexCount = total front vertex count; back vertices start at index frontVertexCount
     // ex: uSteps=3, vSteps=2 -> frontVertexCount=4*3=12; back verts are indices 12 to 23
     int frontVertexCount = (uSteps + 1) * (vSteps + 1);
-    // back vertices just reuse cached front positions, only flip the normal for inside rendering
+    // back vertices reuse cached front positions and normals, only flip the normal for inside rendering
     for (int vId = 0; vId <= vSteps; vId++)
-        for (int uId = 0; uId <= uSteps; uId++) {
-            double u = u0 + (u1 - u0) * (double)uId / uSteps, v = v0 + (v1 - v0) * (double)vId / vSteps;
-            appendVertex(face, frontPos[vId * stride + uId], normalFn(u, v) * -1.0);
-        }
+        for (int uId = 0; uId <= uSteps; uId++)
+            appendVertex(face, frontPos[vId * stride + uId], frontNormals[vId * stride + uId] * -1.0);
     // emit two triangles per quad cell (CCW front, CW back)
     // quad corners: bottomLeft, bottomRight, topLeft, topRight
     // ex: vId=0, uId=0, stride=4 -> bottomLeft=0, bottomRight=1, topLeft=4, topRight=5
@@ -495,7 +498,7 @@ TessellatedFace tessGrid(SurfaceKind kind, std::function<Vec3(double u, double v
 }
 
 // shared cylinder surface evaluation, reused by both tessCylinder and retessCylinderFace so the math lives in one place
-// positionFn: origin + radius*(cos(u)*X + sin(u)*Y) + v*Z, same formula samplecircle uses for boundary arcs
+// positionFn: origin + radius*(cos(u)*X + sin(u)*Y) + v*Z, same formula sampleCircle uses for boundary arcs
 // normalFn: outward radial direction (same for all v at a given u), ex: u=0 -> (1,0,0), u=pi/2 -> (0,1,0)
 static auto cylPositionFn(Vec3 origin, Vec3 X, Vec3 Y, Vec3 Z, double radius)
 {
@@ -784,7 +787,7 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
         // project the plane centroid (raw STEP position + current draw-space offset) onto the cylinder axis,
         // the offset must be included because a prior heal may have extended heightMax, shifting the midpoint
         Vec3 toCentroid = { planeCent.x - cylSurf.axis.origin.x, planeCent.y - cylSurf.axis.origin.y, planeCent.z - cylSurf.axis.origin.z };
-        double planeOffset = planeOff.x * cylAxis.x + planeOff.y * cylAxis.y + planeOff.z * cylAxis.z;
+        double planeOffset = cylAxis.dot(planeOff);
         double planeProjectionHeight = toCentroid.dot(cylAxis) + planeOffset;
         const CylinderHeightRange& cylHeightRange = model.cylHeightRanges[cylId];
 
@@ -834,7 +837,7 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
 // is flipped so the cylinder mirrors correctly and subsequent frames continue healing from the new orientation
 void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cache, Vec3 planeNormal, Vector3 delta)
 {
-    double axialDelta = planeNormal.x * delta.x + planeNormal.y * delta.y + planeNormal.z * delta.z;
+    double axialDelta = planeNormal.dot(delta);
     if (std::abs(axialDelta) < 1e-8)
         return;
     for (auto& entry : cache) {

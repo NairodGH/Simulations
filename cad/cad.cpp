@@ -34,13 +34,27 @@ CadModel::~CadModel()
         UnloadMesh(mesh);
 }
 
-// returns the bbox center in original STEP space, used to undo the centering applied in drawCadModel
-static Vector3 modelCenter(const CadModel& model)
+#pragma region constraints
+// returns all face IDs reachable from startFace through the constraint graph (includes startFace itself)
+static std::vector<int> reachableFaces(const CadModel& model, int startFace)
 {
-    return { (model.bbox.min.x + model.bbox.max.x) * 0.5f, (model.bbox.min.y + model.bbox.max.y) * 0.5f, (model.bbox.min.z + model.bbox.max.z) * 0.5f };
+    std::vector<int> queue = { startFace }, visited = { startFace };
+    int head = 0;
+    while (head < (int)queue.size()) {
+        int currentFace = queue[head++];
+        for (const auto& pair : model.constraints) {
+            if (pair.faceA != currentFace && pair.faceB != currentFace)
+                continue;
+            int other = (pair.faceA == currentFace) ? pair.faceB : pair.faceA;
+            if (std::find(visited.begin(), visited.end(), other) != visited.end())
+                continue;
+            visited.push_back(other);
+            queue.push_back(other);
+        }
+    }
+    return visited; // includes startFace
 }
 
-#pragma region constraints
 // distance: partner receives the same delta (rigid pair)
 // symmetry: partner receives delta with its normal-axis component negated (mirror)
 // both: axial component is already zero from clampDeltaForConstraints, so partner receives tangential only
@@ -50,7 +64,7 @@ static Vector3 derivedDelta(const CadModel& model, const ConstraintPair& constra
     if (constraintPair.hasDistance && !constraintPair.hasSymmetry)
         return incomingDelta;
     Vec3 normal = model.faceSurfaces[constraintPair.faceA].axis.zDirection.norm();
-    double axialScalar = normal.x * incomingDelta.x + normal.y * incomingDelta.y + normal.z * incomingDelta.z;
+    double axialScalar = normal.dot(incomingDelta);
     // symmetry-only: mirror the axial component (multiply by -1), distance+symmetry: kill it (multiply by 0)
     double axialTargetMultiplier = constraintPair.hasDistance ? 0.0 : -1.0;
     double axialCorrection = (axialTargetMultiplier - 1.0) * axialScalar;
@@ -58,14 +72,18 @@ static Vector3 derivedDelta(const CadModel& model, const ConstraintPair& constra
         incomingDelta.z + (float)(axialCorrection * normal.z) };
 }
 
-// DFS (Depth-first search, explores as far as possible along each branch before backtracking) over the constraint graph starting from
+// BFS (Breadth-first search, explores level by level using a queue) over the constraint graph starting from
 // rootFace (root face we moved) with rootDelta (how much we moved), returns the full set of (faceId, deltaToApply) pairs for every transitively reachable
 // constrained face
 static std::vector<std::pair<int, Vector3>> collectConstrainedMoves(const CadModel& model, int rootFace, Vector3 rootDelta)
 {
     std::vector<std::pair<int, Vector3>> queue = { { rootFace, rootDelta } }; // ofc face we moved is in the list
-    std::vector<int> visited = { rootFace }; // and we already visited it
+    std::vector<int> visited = reachableFaces(model, rootFace); // reuse shared BFS, all reachable ids already known
+    // rebuild queue entries for each reachable face with derived deltas
+    // visited[0] = rootFace (already in queue), walk constraint edges in BFS order to assign derived deltas
     int readHead = 0; // cursor into queue, advances instead of popping so queue doubles as the result
+    // reset, we only pre-filled visited for de-dup, the queue still drives derivedDelta propagation
+    visited = { rootFace };
     while (readHead < (int)queue.size()) {
         auto [currentFace, currentDelta] = queue[readHead++];
         for (const auto& constraintPair : model.constraints) {
@@ -91,21 +109,7 @@ static std::vector<std::pair<int, Vector3>> collectConstrainedMoves(const CadMod
 static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vector3& delta)
 {
     // walk the full reachable constraint graph from movingFace (same BFS as collectConstrainedMoves)
-    std::vector<int> queue = { movingFace };
-    std::vector<int> visited = { movingFace };
-    int readHead = 0;
-    while (readHead < (int)queue.size()) {
-        int currentFace = queue[readHead++];
-        for (const auto& constraintPair : model.constraints) {
-            if (constraintPair.faceA != currentFace && constraintPair.faceB != currentFace)
-                continue;
-            int otherFace = (constraintPair.faceA == currentFace) ? constraintPair.faceB : constraintPair.faceA;
-            if (std::find(visited.begin(), visited.end(), otherFace) != visited.end())
-                continue;
-            visited.push_back(otherFace);
-            queue.push_back(otherFace);
-        }
-    }
+    std::vector<int> visited = reachableFaces(model, movingFace);
     // check every pair whose both endpoints are in the reachable set for S+D
     bool clamped = false;
     for (const auto& constraintPair : model.constraints) {
@@ -116,7 +120,7 @@ static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vect
         if (!aReachable || !bReachable)
             continue; // pair is not part of the reachable chain
         Vec3 normal = model.faceSurfaces[constraintPair.faceA].axis.zDirection.norm();
-        double axialScalar = normal.x * delta.x + normal.y * delta.y + normal.z * delta.z;
+        double axialScalar = normal.dot(delta);
         if (std::abs(axialScalar) < 1e-8)
             continue; // purely tangential move (ex: translation on x or y when both are aligned on z), nothing to clamp
         delta.x -= (float)(axialScalar * normal.x);
@@ -138,12 +142,10 @@ static void propagateConstraints(CadModel& model, int movingFace, Vector3 delta)
         model.faceOffsets[otherFace].y += offsetDelta.y;
         model.faceOffsets[otherFace].z += offsetDelta.z;
         // look up the heal cache built specifically for otherFace at gesture start
-        for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-            if (cacheId != otherFace)
-                continue;
+        auto it = model.propagatedHealCaches.find(otherFace);
+        if (it != model.propagatedHealCaches.end()) {
             Vec3 faceNormal = model.faceSurfaces[otherFace].axis.zDirection.norm();
-            applyCylinderHealCache(model, cacheEntries, faceNormal, offsetDelta);
-            break; // each face has exactly one entry in the map so dont bother continuing
+            applyCylinderHealCache(model, it->second, faceNormal, offsetDelta);
         }
     }
 }
@@ -154,7 +156,7 @@ static void propagateConstraints(CadModel& model, int movingFace, Vector3 delta)
 static Vector3 faceCentroid(const CadModel& model, int faceId)
 {
     const TessellatedFace& face = model.cpuFaceData[faceId];
-    Vector3 center = modelCenter(model);
+    Vector3 center = model.center;
     Vector3 offset = model.faceOffsets[faceId];
     int frontVertCount = (int)face.vertices.size() / 6; // only front-face vertices
     if (frontVertCount == 0)
@@ -207,7 +209,7 @@ static float rayTriangleIntersect(Ray ray, Vec3 A, Vec3 B, Vec3 C)
     if (std::abs(alignment) < epsilon)
         return -1.0f;
     float inverseAlignment = 1.0f / alignment; // division is more expensive than multiplication so we'll multiply by this instead of dividing by alignment
-    Vec3 R = { ray.position.x, ray.position.y, ray.position.z }; //ray origin
+    Vec3 R = { ray.position.x, ray.position.y, ray.position.z }; // ray origin
     Vec3 AR = R - A;
     // instead of describing a point's position as "X units right, Y units up from some origin," barycentric coordinates describe it as
     // "how much of each corner of a triangle contributes to this point", every point in or near a triangle gets three numbers (U, V, W) that sum to 1,
@@ -231,7 +233,7 @@ static float rayTriangleIntersect(Ray ray, Vec3 A, Vec3 B, Vec3 C)
 // adds bbox center back to the ray so it's in the same space as the vertex data (drawCadModel subtracts the center)
 static int pickFace(const CadModel& model, Ray ray)
 {
-    Vector3 center = modelCenter(model);
+    Vector3 center = model.center;
     ray.position.x += center.x;
     ray.position.y += center.y;
     ray.position.z += center.z;
@@ -270,8 +272,7 @@ void drawCadModel(const CadModel& model)
     // translate so the model is centered at the origin before applying the caller's transform
     // this keeps orbit/zoom behavior symmetric regardless of where the STEP geometry is placed
     // ex: bbox min=(10,0,0), max=(20,0,0) -> center=(15,0,0), translate by (-15,0,0)
-    Vector3 center
-        = { (model.bbox.min.x + model.bbox.max.x) * 0.5f, (model.bbox.min.y + model.bbox.max.y) * 0.5f, (model.bbox.min.z + model.bbox.max.z) * 0.5f };
+    Vector3 center = model.center;
     Matrix centeredTransform = MatrixTranslate(-center.x, -center.y, -center.z);
     // every triangle has a front and a back determined by winding order, the GPU normally throws away (culls) triangles whose back is facing the camera,
     // this is an optimization since you never see the inside of a solid mesh, the problem here is that the tessellated faces have no consistent "outside",
@@ -297,7 +298,7 @@ static void drawSelectedFaceHighlight(const CadModel& model)
 {
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.meshes.size())
         return;
-    Vector3 center = modelCenter(model);
+    Vector3 center = model.center;
     Vector3 offset = model.faceOffsets[model.selectedFace];
     Matrix centeredTransform = MatrixMultiply(MatrixTranslate(offset.x, offset.y, offset.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
@@ -322,7 +323,7 @@ static void drawSelectedFaceHighlight(const CadModel& model)
 // redraws the distance-reference face (shift+right clicked) with a brightened tint (so we know we clicked well)
 static void drawSecondFaceHighlight(const CadModel& model)
 {
-    Vector3 center = modelCenter(model);
+    Vector3 center = model.center;
     Vector3 offset = model.faceOffsets[model.secondFace];
     Matrix centeredTransform = MatrixMultiply(MatrixTranslate(offset.x, offset.y, offset.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
@@ -339,22 +340,30 @@ static void drawSecondFaceHighlight(const CadModel& model)
 }
 
 // computes the AABB of the face in draw space (with centering applied)
+static BoundingBox emptyBBox()
+{
+    constexpr float inf = std::numeric_limits<float>::max();
+    return { { inf, inf, inf }, { -inf, -inf, -inf } };
+}
+
+static void expandBBox(BoundingBox& bbox, float x, float y, float z)
+{
+    bbox.min.x = std::min(bbox.min.x, x);
+    bbox.max.x = std::max(bbox.max.x, x);
+    bbox.min.y = std::min(bbox.min.y, y);
+    bbox.max.y = std::max(bbox.max.y, y);
+    bbox.min.z = std::min(bbox.min.z, z);
+    bbox.max.z = std::max(bbox.max.z, z);
+}
+
 static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center, Vector3 offset = { 0.0f, 0.0f, 0.0f })
 {
-    BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
-        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
+    BoundingBox bbox = emptyBBox();
     int frontVertexCount = (int)face.vertices.size() / 6;
     for (int i = 0; i < frontVertexCount; i++) {
         int base = i * 3;
-        float x = face.vertices[base] - center.x + offset.x;
-        float y = face.vertices[base + 1] - center.y + offset.y;
-        float z = face.vertices[base + 2] - center.z + offset.z;
-        bbox.min.x = std::min(bbox.min.x, x);
-        bbox.max.x = std::max(bbox.max.x, x);
-        bbox.min.y = std::min(bbox.min.y, y);
-        bbox.max.y = std::max(bbox.max.y, y);
-        bbox.min.z = std::min(bbox.min.z, z);
-        bbox.max.z = std::max(bbox.max.z, z);
+        expandBBox(
+            bbox, face.vertices[base] - center.x + offset.x, face.vertices[base + 1] - center.y + offset.y, face.vertices[base + 2] - center.z + offset.z);
     }
     return bbox;
 }
@@ -398,37 +407,29 @@ static float computeFaceMinDistance(
 // pass center={0,0,0} and a single face's offset to get a per-face bbox, or modelCenter() and per-face offsets for the full model
 static BoundingBox computeModelBBox(const CadModel& model, Vector3 center)
 {
-    BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
-        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
+    BoundingBox bbox = emptyBBox();
     for (int fi = 0; fi < (int)model.cpuFaceData.size(); fi++) {
         const auto& face = model.cpuFaceData[fi];
         Vector3 offset = model.faceOffsets[fi];
         int frontVertexCount = (int)face.vertices.size() / 6;
         for (int i = 0; i < frontVertexCount; i++) {
             int base = i * 3;
-            float x = face.vertices[base] - center.x + offset.x;
-            float y = face.vertices[base + 1] - center.y + offset.y;
-            float z = face.vertices[base + 2] - center.z + offset.z;
-            bbox.min.x = std::min(bbox.min.x, x);
-            bbox.max.x = std::max(bbox.max.x, x);
-            bbox.min.y = std::min(bbox.min.y, y);
-            bbox.max.y = std::max(bbox.max.y, y);
-            bbox.min.z = std::min(bbox.min.z, z);
-            bbox.max.z = std::max(bbox.max.z, z);
+            expandBBox(
+                bbox, face.vertices[base] - center.x + offset.x, face.vertices[base + 1] - center.y + offset.y, face.vertices[base + 2] - center.z + offset.z);
         }
     }
     return bbox;
 }
 
 // draws the whole model bounding box in gold, recomputed each call to reflect current face offsets
-static void drawModelBbox(const CadModel& model) { DrawBoundingBox(computeModelBBox(model, modelCenter(model)), GOLD); }
+static void drawModelBbox(const CadModel& model) { DrawBoundingBox(computeModelBBox(model, model.center), GOLD); }
 
 // draws the bounding box of the selected face in orange, for planes this will be a flat rectangle, for cylinders/toruses a proper 3D box
 static void drawFaceBbox(const CadModel& model)
 {
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.cpuFaceData.size())
         return;
-    DrawBoundingBox(computeFaceBBox(model.cpuFaceData[model.selectedFace], modelCenter(model), model.faceOffsets[model.selectedFace]), ORANGE);
+    DrawBoundingBox(computeFaceBBox(model.cpuFaceData[model.selectedFace], model.center, model.faceOffsets[model.selectedFace]), ORANGE);
 }
 
 // draws small yellow outward normal arrows per triangle of the selected face (front-face triangles only, strided to avoid clutter)
@@ -437,7 +438,7 @@ static void drawFaceNormals(const CadModel& model, float normalLength)
 {
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.cpuFaceData.size())
         return;
-    Vector3 center = modelCenter(model);
+    Vector3 center = model.center;
     Vector3 offset = model.faceOffsets[model.selectedFace];
     const auto& faceData = model.cpuFaceData[model.selectedFace];
     // tessGrid emits front vertices first then back vertices (same count), so front indices are all < frontVertexCount
@@ -468,7 +469,7 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
 {
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.faceSurfaces.size())
         return;
-    Vector3 center = modelCenter(model);
+    Vector3 center = model.center;
     Vector3 offset = model.faceOffsets[model.selectedFace];
     const Surface& surface = model.faceSurfaces[model.selectedFace];
 
@@ -476,24 +477,10 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
     case SurfaceKind::Plane: {
         // one big normal arrow from the face centroid along zDirection which is the average position of all front-face vertices in draw space
         // (with centering already applied), used to anchor axis/normal arrows at the visual center of the face
-        const TessellatedFace& face = model.cpuFaceData[model.selectedFace];
-        int frontVertexCount = (int)face.vertices.size() / 6; // front vertices occupy the 1rst half of the flat array (2nd half is the back-face duplicates)
-        Vector3 faceCentroid = { 0, 0, 0 };
-        for (int i = 0; i < frontVertexCount; i++) {
-            int base = i * 3;
-            faceCentroid.x += face.vertices[base] - center.x + offset.x;
-            faceCentroid.y += face.vertices[base + 1] - center.y + offset.y;
-            faceCentroid.z += face.vertices[base + 2] - center.z + offset.z;
-        }
-        if (frontVertexCount > 0) {
-            float inverse = 1.0f / (float)frontVertexCount; //mult faster than div
-            faceCentroid.x *= inverse;
-            faceCentroid.y *= inverse;
-            faceCentroid.z *= inverse;
-        }
+        Vector3 fc = faceCentroid(model, model.selectedFace);
         Vec3 normal = surface.axis.zDirection.norm();
-        Vector3 tip = { faceCentroid.x + (float)normal.x * scale, faceCentroid.y + (float)normal.y * scale, faceCentroid.z + (float)normal.z * scale };
-        DrawLine3D(faceCentroid, tip, SKYBLUE);
+        Vector3 tip = { fc.x + (float)normal.x * scale, fc.y + (float)normal.y * scale, fc.z + (float)normal.z * scale };
+        DrawLine3D(fc, tip, SKYBLUE);
         break;
     }
     case SurfaceKind::Cylinder:
@@ -515,7 +502,8 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
 
 // draws the area-weighted average orientation of all faces as a SKYBLUE arrow from the live model center
 // each face contributes its zDirection (plane normal / cylinder+torus axis) weighted by its tessellated area
-static void drawModelAverageNormal(const CadModel& model, float scale)
+// liveBbox is passed in from the caller so it is not recomputed here (drawUI already computes it for the same frame)
+static void drawModelAverageNormal(const CadModel& model, float scale, BoundingBox liveBbox)
 {
     Vec3 weightedSum = { 0, 0, 0 };
     for (int i = 0; i < (int)model.faceSurfaces.size(); i++) {
@@ -526,8 +514,6 @@ static void drawModelAverageNormal(const CadModel& model, float scale)
     Vec3 avgNormal = weightedSum.norm();
     // anchor at the live bbox center in draw space (live center minus the static centering offset)
     // as faces are push/pulled the live center drifts, keeping the arrow visually attached to the actual model centroid
-    Vector3 staticCenter = modelCenter(model);
-    BoundingBox liveBbox = computeModelBBox(model, staticCenter);
     Vector3 origin3D = { (liveBbox.min.x + liveBbox.max.x) * 0.5f, (liveBbox.min.y + liveBbox.max.y) * 0.5f, (liveBbox.min.z + liveBbox.max.z) * 0.5f };
     Vector3 tip = { origin3D.x + (float)avgNormal.x * scale, origin3D.y + (float)avgNormal.y * scale, origin3D.z + (float)avgNormal.z * scale };
     DrawLine3D(origin3D, tip, SKYBLUE);
@@ -638,7 +624,7 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             // build one heal cache per partner face, keyed by face index
             model.propagatedHealCaches.clear();
             for (const auto& [partnerFace, _] : constrainedMoves)
-                model.propagatedHealCaches.push_back({ partnerFace, buildCylinderHealCache(model, partnerFace) });
+                model.propagatedHealCaches[partnerFace] = buildCylinderHealCache(model, partnerFace);
             // snapshot the pre-gesture offsets of the moving face and the ones of all faces down the constraints chains
             UndoEntry entry;
             entry.faceId = model.selectedFace;
@@ -698,7 +684,7 @@ static void handle1SelectControls(CadModel& model, float diagonal)
                 for (const auto& propagatedEntry : cacheEntries)
                     preFrame.emplace(propagatedEntry.cylFaceId, model.cylHeightRanges[propagatedEntry.cylFaceId]);
 
-            double primaryAxialDelta = planeNormal.x * delta.x + planeNormal.y * delta.y + planeNormal.z * delta.z;
+            double primaryAxialDelta = planeNormal.dot(delta);
 
             // pre-compute how much each chained face moves once, so the per-cylinder loop below can just look it up
             std::unordered_map<int, Vector3> propagatedOffsetsDeltas; // how much each chained face moves this frame as a 3D vector x y z
@@ -713,7 +699,7 @@ static void handle1SelectControls(CadModel& model, float diagonal)
                     }
                 propagatedOffsetsDeltas[cacheId] = offsetDelta;
                 Vec3 partnerNormal = model.faceSurfaces[cacheId].axis.zDirection.norm();
-                propagatedAxialDeltas[cacheId] = partnerNormal.x * offsetDelta.x + partnerNormal.y * offsetDelta.y + partnerNormal.z * offsetDelta.z;
+                propagatedAxialDeltas[cacheId] = partnerNormal.dot(offsetDelta);
             }
 
             // for every cylinder in the pre-frame snapshot, accumulate cap (end circle) deltas from every
@@ -996,7 +982,7 @@ static void drawToasts(const CadModel& model)
     }
 }
 
-static void drawUI(const CadModel& model)
+static void drawUI(const CadModel& model, BoundingBox liveBbox)
 {
     // stats panel with running Y so adding lines never requires renumbering
     // four blocks separated by a small gap, each block has its own color tier
@@ -1021,9 +1007,6 @@ static void drawUI(const CadModel& model)
     // block 2
     DrawText(TextFormat("Faces: %d\nTriangles: %d", (int)model.meshes.size(), model.totalTriangleCount), 20, uiY, 16, paleLime);
     uiY += uiStep * 2; // two lines because of the \n
-
-    Vector3 mCenter = modelCenter(model);
-    BoundingBox liveBbox = computeModelBBox(model, mCenter);
     DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", liveBbox.max.x - liveBbox.min.x, liveBbox.max.y - liveBbox.min.y,
                  liveBbox.max.z - liveBbox.min.z),
         20, uiY, 16, paleLime);
@@ -1052,7 +1035,7 @@ static void drawUI(const CadModel& model)
             20, uiY, 16, paleYellow);
         uiY += uiStep * 3;
 
-        Vector3 center = modelCenter(model);
+        Vector3 center = model.center;
         BoundingBox faceBbox = computeFaceBBox(model.cpuFaceData[faceId], center, model.faceOffsets[faceId]);
         DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
                      faceBbox.max.z - faceBbox.min.z),
@@ -1100,8 +1083,7 @@ CadModel loadStep(const std::string& path, int arcSegs)
     CadModel model;
     // initialize bbox inverted so the first real vertex always wins both min and max comparisons
     // ex: first vertex at (3,1,2) -> min becomes (3,1,2), max becomes (3,1,2)
-    model.bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
-        { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
+    model.bbox = emptyBBox();
     StepMap entityMap = parseStepFile(path);
 
     // collect all ADVANCED_FACE entity IDs (each face becomes one mesh)
@@ -1123,12 +1105,7 @@ CadModel loadStep(const std::string& path, int arcSegs)
         int frontVertCount = (int)tessellatedFace.vertices.size() / 6; // front_count = total_floats/3 / 2
         for (int i = 0; i < frontVertCount; i++) {
             int base = i * 3;
-            model.bbox.min.x = std::min(model.bbox.min.x, tessellatedFace.vertices[base]);
-            model.bbox.min.y = std::min(model.bbox.min.y, tessellatedFace.vertices[base + 1]);
-            model.bbox.min.z = std::min(model.bbox.min.z, tessellatedFace.vertices[base + 2]);
-            model.bbox.max.x = std::max(model.bbox.max.x, tessellatedFace.vertices[base]);
-            model.bbox.max.y = std::max(model.bbox.max.y, tessellatedFace.vertices[base + 1]);
-            model.bbox.max.z = std::max(model.bbox.max.z, tessellatedFace.vertices[base + 2]);
+            expandBBox(model.bbox, tessellatedFace.vertices[base], tessellatedFace.vertices[base + 1], tessellatedFace.vertices[base + 2]);
         }
         Mesh mesh = uploadMesh(tessellatedFace);
         if (mesh.vertexCount == 0)
@@ -1143,6 +1120,7 @@ CadModel loadStep(const std::string& path, int arcSegs)
         model.cylHeightRanges.push_back(cylHeightRange); // will be 0 for other shapes, still need to push for SoA
         model.totalTriangleCount += (int)(tessellatedFace.indices.size() / 6); // front triangles only
     }
+    model.center = { (model.bbox.min.x + model.bbox.max.x) * 0.5f, (model.bbox.min.y + model.bbox.max.y) * 0.5f, (model.bbox.min.z + model.bbox.max.z) * 0.5f };
     return model;
 }
 
@@ -1208,6 +1186,9 @@ int main()
         }
         handleControls(model, camera, yaw, pitch, orbitRadius, showNormals, showBbox, diagonal);
 
+        // compute live bbox once per frame so drawModelAverageNormal and drawUI share the same result
+        BoundingBox liveBbox = computeModelBBox(model, model.center);
+
         BeginDrawing();
         {
             ClearBackground({ 18, 18, 22, 255 });
@@ -1228,12 +1209,12 @@ int main()
                         drawFaceNormals(model, diagonal * 0.03f);
                         drawFaceAnalyticalAxis(model, diagonal * 0.15f);
                     } else {
-                        drawModelAverageNormal(model, diagonal * 0.3f);
+                        drawModelAverageNormal(model, diagonal * 0.3f, liveBbox);
                     }
                 }
             }
             EndMode3D();
-            drawUI(model);
+            drawUI(model, liveBbox);
         }
         EndDrawing();
     }

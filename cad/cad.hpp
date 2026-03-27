@@ -7,8 +7,10 @@ struct Vec3 {
     Vec3 operator+(const Vec3& o) const { return { x + o.x, y + o.y, z + o.z }; }
     Vec3 operator-(const Vec3& o) const { return { x - o.x, y - o.y, z - o.z }; }
     Vec3 operator*(double t) const { return { x * t, y * t, z * t }; }
+    friend Vec3 operator*(double t, const Vec3& v) { return v * t; }
     // measures how much two vectors point in the same direction (1 = same, 0 = perpendicular, -1 = opposite)
     double dot(const Vec3& o) const { return x * o.x + y * o.y + z * o.z; }
+    double dot(const Vector3& o) const { return x * o.x + y * o.y + z * o.z; }
     // gives a vector perpendicular to both, and its sign (or its Z component in 2D) tells you which side of a line a point is on
     // positive = left turn, negative = right turn
     Vec3 cross(const Vec3& o) const { return { y * o.z - z * o.y, z * o.x - x * o.z, x * o.y - y * o.x }; }
@@ -146,7 +148,7 @@ struct CadModel {
     std::vector<UndoEntry> undoStack; // pushed once on gesture
     std::vector<UndoEntry> redoStack; // cleared on new translation, populated by undo
     std::vector<CylinderHealEntry> healCache; // built at gesture start, cleared at end
-    std::vector<std::pair<int, std::vector<CylinderHealEntry>>> propagatedHealCaches; // same, (faceId, healEntries) per propagated face
+    std::unordered_map<int, std::vector<CylinderHealEntry>> propagatedHealCaches; // same, faceId -> healEntries per propagated face
     int cachedHealFace = -1; // selectedFace at the time the heal cache was built
     bool translating = false; // on translation key pressed
     bool wasTranslating = false; // every frame after 1rst one while we're pressing
@@ -163,6 +165,7 @@ struct CadModel {
     // used only to derive modelCenter() which is the fixed origin for all draw-space transforms,
     // for the live extent including current face offsets use computeModelBBox()
     BoundingBox bbox;
+    Vector3 center = { 0.0f, 0.0f, 0.0f }; // bbox center, computed once at end of loadStep, constant after load
     int totalTriangleCount = 0; // will never change, even for geometry healed cylinders because UV grid tessellation doesnt create new triangles
 
     // ok crazy stuff next (spent way too much searching for the problem): C++ Rule of Five says if you define any one of destructor, copy constructor, copy
@@ -199,7 +202,8 @@ Surface resolveSurface(int id, const StepMap& map);
 BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs);
 
 // tessellator.cpp
-TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
+TessellatedFace tessellateAdvancedFace(
+    int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
 float computeFaceArea(const TessellatedFace& face);
 Mesh uploadMesh(const TessellatedFace& tessellatedFace);
 void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax);
