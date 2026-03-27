@@ -45,27 +45,29 @@ static Vector3 modelCenter(const CadModel& model)
 // symmetry: partner receives delta with its normal-axis component negated (mirror)
 // both: axial component is already zero from clampDeltaForConstraints, so partner receives tangential only
 // (if translate on z, normal is 0 0 1, if incomingDelta is 3 4 5, axisScalar is 5 (0 if both ^) and tangential is everything else so 3 4 0)
-static Vector3 derivedDelta(const CadModel& model, const ConstraintPair& cp, Vector3 incomingDelta)
+static Vector3 derivedDelta(const CadModel& model, const ConstraintPair& constraintPair, Vector3 incomingDelta)
 {
-    if (cp.hasDistance && !cp.hasSymmetry)
+    if (constraintPair.hasDistance && !constraintPair.hasSymmetry)
         return incomingDelta;
-    Vec3 normal = model.faceSurfaces[cp.faceA].axis.zDir.norm();
+    Vec3 normal = model.faceSurfaces[constraintPair.faceA].axis.zDirection.norm();
     double axialScalar = normal.x * incomingDelta.x + normal.y * incomingDelta.y + normal.z * incomingDelta.z;
-    double axialmult = cp.hasDistance ? 0.0 : -1.0;
-    return { incomingDelta.x + (float)((axialmult - 1.0) * axialScalar * normal.x), incomingDelta.y + (float)((axialmult - 1.0) * axialScalar * normal.y),
-        incomingDelta.z + (float)((axialmult - 1.0) * axialScalar * normal.z) };
+    // symmetry-only: mirror the axial component (multiply by -1), distance+symmetry: kill it (multiply by 0)
+    double axialTargetMultiplier = constraintPair.hasDistance ? 0.0 : -1.0;
+    double axialCorrection = (axialTargetMultiplier - 1.0) * axialScalar;
+    return { incomingDelta.x + (float)(axialCorrection * normal.x), incomingDelta.y + (float)(axialCorrection * normal.y),
+        incomingDelta.z + (float)(axialCorrection * normal.z) };
 }
 
 // DFS (Depth-first search, explores as far as possible along each branch before backtracking) over the constraint graph starting from
 // rootFace (root face we moved) with rootDelta (how much we moved), returns the full set of (faceId, deltaToApply) pairs for every transitively reachable
-// constrained face,
+// constrained face
 static std::vector<std::pair<int, Vector3>> collectConstrainedMoves(const CadModel& model, int rootFace, Vector3 rootDelta)
 {
     std::vector<std::pair<int, Vector3>> queue = { { rootFace, rootDelta } }; // ofc face we moved is in the list
     std::vector<int> visited = { rootFace }; // and we already visited it
-    int workId = 0; // cursor into queue, advances instead of popping so queue doubles as the result
-    while (workId < (int)queue.size()) {
-        auto [currentFace, currentDelta] = queue[workId++];
+    int readHead = 0; // cursor into queue, advances instead of popping so queue doubles as the result
+    while (readHead < (int)queue.size()) {
+        auto [currentFace, currentDelta] = queue[readHead++];
         for (const auto& constraintPair : model.constraints) {
             if (constraintPair.faceA != currentFace && constraintPair.faceB != currentFace)
                 continue; // skip any string that doesn't involve the current face
@@ -91,13 +93,13 @@ static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vect
     // walk the full reachable constraint graph from movingFace (same BFS as collectConstrainedMoves)
     std::vector<int> queue = { movingFace };
     std::vector<int> visited = { movingFace };
-    int workId = 0;
-    while (workId < (int)queue.size()) {
-        int currentFace = queue[workId++];
-        for (const auto& cp : model.constraints) {
-            if (cp.faceA != currentFace && cp.faceB != currentFace)
+    int readHead = 0;
+    while (readHead < (int)queue.size()) {
+        int currentFace = queue[readHead++];
+        for (const auto& constraintPair : model.constraints) {
+            if (constraintPair.faceA != currentFace && constraintPair.faceB != currentFace)
                 continue;
-            int otherFace = (cp.faceA == currentFace) ? cp.faceB : cp.faceA;
+            int otherFace = (constraintPair.faceA == currentFace) ? constraintPair.faceB : constraintPair.faceA;
             if (std::find(visited.begin(), visited.end(), otherFace) != visited.end())
                 continue;
             visited.push_back(otherFace);
@@ -106,14 +108,14 @@ static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vect
     }
     // check every pair whose both endpoints are in the reachable set for S+D
     bool clamped = false;
-    for (const auto& cp : model.constraints) {
-        if (!cp.hasDistance || !cp.hasSymmetry)
+    for (const auto& constraintPair : model.constraints) {
+        if (!constraintPair.hasDistance || !constraintPair.hasSymmetry)
             continue;
-        bool aReachable = std::find(visited.begin(), visited.end(), cp.faceA) != visited.end();
-        bool bReachable = std::find(visited.begin(), visited.end(), cp.faceB) != visited.end();
+        bool aReachable = std::find(visited.begin(), visited.end(), constraintPair.faceA) != visited.end();
+        bool bReachable = std::find(visited.begin(), visited.end(), constraintPair.faceB) != visited.end();
         if (!aReachable || !bReachable)
             continue; // pair is not part of the reachable chain
-        Vec3 normal = model.faceSurfaces[cp.faceA].axis.zDir.norm();
+        Vec3 normal = model.faceSurfaces[constraintPair.faceA].axis.zDirection.norm();
         double axialScalar = normal.x * delta.x + normal.y * delta.y + normal.z * delta.z;
         if (std::abs(axialScalar) < 1e-8)
             continue; // purely tangential move (ex: translation on x or y when both are aligned on z), nothing to clamp
@@ -131,16 +133,16 @@ static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vect
 // regardless of how many constraint pairs involve that face
 static void propagateConstraints(CadModel& model, int movingFace, Vector3 delta)
 {
-    for (auto& [otherFace, od] : collectConstrainedMoves(model, movingFace, delta)) {
-        model.faceOffsets[otherFace].x += od.x;
-        model.faceOffsets[otherFace].y += od.y;
-        model.faceOffsets[otherFace].z += od.z;
+    for (auto& [otherFace, offsetDelta] : collectConstrainedMoves(model, movingFace, delta)) {
+        model.faceOffsets[otherFace].x += offsetDelta.x;
+        model.faceOffsets[otherFace].y += offsetDelta.y;
+        model.faceOffsets[otherFace].z += offsetDelta.z;
         // look up the heal cache built specifically for otherFace at gesture start
         for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
             if (cacheId != otherFace)
                 continue;
-            Vec3 faceNormal = model.faceSurfaces[otherFace].axis.zDir.norm();
-            applyCylinderHealCache(model, cacheEntries, faceNormal, od);
+            Vec3 faceNormal = model.faceSurfaces[otherFace].axis.zDirection.norm();
+            applyCylinderHealCache(model, cacheEntries, faceNormal, offsetDelta);
             break; // each face has exactly one entry in the map so dont bother continuing
         }
     }
@@ -151,28 +153,27 @@ static void propagateConstraints(CadModel& model, int movingFace, Vector3 delta)
 // every mesh before drawing it so the model appears centered at the world origin regardless of where the STEP file placed it),
 static Vector3 faceCentroid(const CadModel& model, int faceId)
 {
-    const TessellatedFace& face = model.pickData[faceId];
+    const TessellatedFace& face = model.cpuFaceData[faceId];
     Vector3 center = modelCenter(model);
-    Vector3 off = model.faceOffsets[faceId];
+    Vector3 offset = model.faceOffsets[faceId];
     int frontVertCount = (int)face.vertices.size() / 6; // only front-face vertices
     if (frontVertCount == 0)
         return { 0.0f, 0.0f, 0.0f };
-    Vector3 sum = { 0.0f, 0.0f, 0.0f };
+    Vector3 positionSum = { 0.0f, 0.0f, 0.0f };
     for (int i = 0; i < frontVertCount; i++) {
         int base = i * 3;
-        sum.x += face.vertices[base] - center.x + off.x;
-        sum.y += face.vertices[base + 1] - center.y + off.y;
-        sum.z += face.vertices[base + 2] - center.z + off.z;
+        positionSum.x += face.vertices[base] - center.x + offset.x;
+        positionSum.y += face.vertices[base + 1] - center.y + offset.y;
+        positionSum.z += face.vertices[base + 2] - center.z + offset.z;
     }
-    float inv = 1.0f / (float)frontVertCount;
-    return { sum.x * inv, sum.y * inv, sum.z * inv };
+    return { positionSum.x / (float)frontVertCount, positionSum.y / (float)frontVertCount, positionSum.z / (float)frontVertCount };
 }
 
 // signed distance from origin (0 0 0) to centroid's closest point when going in normal direction
 // ex: normal 0 0 1, centroid at 5 3 10, result is 10, if centroid at 5 3 -10 then -10 (can't get closer when following normal's path)
 static float computeAxialPos(const CadModel& model, int faceId, int normalRefFaceId)
 {
-    Vec3 normal = model.faceSurfaces[normalRefFaceId].axis.zDir.norm();
+    Vec3 normal = model.faceSurfaces[normalRefFaceId].axis.zDirection.norm();
     Vector3 centroid = faceCentroid(model, faceId);
     return (float)(normal.x * centroid.x + normal.y * centroid.y + normal.z * centroid.z);
 }
@@ -180,10 +181,10 @@ static float computeAxialPos(const CadModel& model, int faceId, int normalRefFac
 // returns the 3D distance between two face centroids
 static float computeCentroidDistance(const CadModel& model, int faceIdA, int faceIdB)
 {
-    Vector3 cA = faceCentroid(model, faceIdA);
-    Vector3 cB = faceCentroid(model, faceIdB);
-    float dx = cB.x - cA.x, dy = cB.y - cA.y, dz = cB.z - cA.z;
-    return sqrtf(dx * dx + dy * dy + dz * dz);
+    Vector3 centroidA = faceCentroid(model, faceIdA);
+    Vector3 centroidB = faceCentroid(model, faceIdB);
+    float distanceX = centroidB.x - centroidA.x, distanceY = centroidB.y - centroidA.y, distanceZ = centroidB.z - centroidA.z;
+    return sqrtf(distanceX * distanceX + distanceY * distanceY + distanceZ * distanceZ);
 }
 
 #pragma region selection
@@ -192,37 +193,38 @@ static float computeCentroidDistance(const CadModel& model, int faceIdA, int fac
 // you can't just ask "does my beam cross the plane of the wall" since the wall is infinite, you need to know if the beam lands inside the triangle,
 // so you describe any point inside the triangle as "start at corner A, walk a fraction toward B then a fraction toward C"
 // if those two fractions are both positive and don't sum to more than 1, you're inside the triangle, this algo solves for exactly those two fractions
-// and the distance t simultaneously, using the ray direction and the two triangle edges as the axes of a little local coordinate system,
-// if the fractions are in bounds and t is positive (the triangle is in front of you, not behind), your flashlight hits the canvas at distance t
-static float rayTriangleIntersect(Ray ray, Vec3 v0, Vec3 v1, Vec3 v2)
+// and the rayDistance simultaneously, using the ray direction and the two triangle edges as the axes of a little local coordinate system,
+// if the fractions are in bounds and rayDistance is positive (the triangle is in front of you, not behind), your flashlight hits the canvas at rayDistance
+static float rayTriangleIntersect(Ray ray, Vec3 A, Vec3 B, Vec3 C)
 {
     const float epsilon = 1e-8f;
-    Vec3 edge1 = v1 - v0, edge2 = v2 - v0;
-    Vec3 rayDir = { ray.direction.x, ray.direction.y, ray.direction.z };
-    Vec3 h = rayDir.cross(edge2);
-    float det = (float)edge1.dot(h);
+    Vec3 AB = B - A, AC = C - A;
+    Vec3 rayDirection = { ray.direction.x, ray.direction.y, ray.direction.z };
+    // perpendicular vector to both rayDirection and AC, used to project AB onto the ray's "sweep plane"
+    Vec3 perpendicular = rayDirection.cross(AC);
+    float alignment = (float)AB.dot(perpendicular);
     // ray is parallel to the triangle plane (dot product of edge and perpendicular is ~0)
-    if (std::abs(det) < epsilon)
+    if (std::abs(alignment) < epsilon)
         return -1.0f;
-    float invDet = 1.0f / det;
-    Vec3 rayOrig = { ray.position.x, ray.position.y, ray.position.z };
-    Vec3 s = rayOrig - v0;
+    float inverseAlignment = 1.0f / alignment; // division is more expensive than multiplication so we'll multiply by this instead of dividing by alignment
+    Vec3 R = { ray.position.x, ray.position.y, ray.position.z }; //ray origin
+    Vec3 AR = R - A;
     // instead of describing a point's position as "X units right, Y units up from some origin," barycentric coordinates describe it as
-    // "how much of each corner of a triangle contributes to this point", every point in or near a triangle gets three numbers (u, v, w) that sum to 1,
+    // "how much of each corner of a triangle contributes to this point", every point in or near a triangle gets three numbers (U, V, W) that sum to 1,
     // each number is the "weight" of the corresponding corner (like three magnets each pulling the point toward each other with a certain strength)
     // ex: centroid is (1/3, 1/3, 1/3), corner A is (1, 0, 0), midpoint of edge AB is (1/2, 1/2, 0), a point outside has at least one negative weight
-    // u is the barycentric coordinate along edge1, must be in [0,1] to be inside the triangle
-    float u = (float)s.dot(h) * invDet;
-    if (u < 0.0f || u > 1.0f)
+    // U is the barycentric coordinate along AB, must be in [0,1] to be inside the triangle
+    float U = (float)AR.dot(perpendicular) * inverseAlignment;
+    if (U < 0.0f || U > 1.0f)
         return -1.0f;
-    Vec3 q = s.cross(edge1);
-    // v is the barycentric coordinate along edge2, u+v must also stay <= 1
-    float v = (float)rayDir.dot(q) * invDet;
-    if (v < 0.0f || u + v > 1.0f)
+    Vec3 crossOriginEdge1 = AR.cross(AB);
+    // V is the barycentric coordinate along AC, U + V must also stay <= 1
+    float V = (float)rayDirection.dot(crossOriginEdge1) * inverseAlignment;
+    if (V < 0.0f || U + V > 1.0f)
         return -1.0f;
-    float t = (float)edge2.dot(q) * invDet;
-    // t must be positive (hit is in front of the ray origin, not behind)
-    return t > epsilon ? t : -1.0f;
+    float rayDistance = (float)AC.dot(crossOriginEdge1) * inverseAlignment;
+    // rayDistance must be positive (hit is in front of the ray origin, not behind)
+    return rayDistance > epsilon ? rayDistance : -1.0f;
 }
 
 // tests the ray against every triangle of every face and returns the index of the closest hit face, -1 if nothing hit
@@ -234,27 +236,27 @@ static int pickFace(const CadModel& model, Ray ray)
     ray.position.y += center.y;
     ray.position.z += center.z;
 
-    float closestT = std::numeric_limits<float>::max();
+    float closestHitDistance = std::numeric_limits<float>::max();
     int hitFace = -1;
     // TODO: AABB pre-pass per face to cull before the triangle loop, brute-force is fine at current face counts but won't scale
-    for (int faceId = 0; faceId < (int)model.pickData.size(); faceId++) {
-        const auto& faceData = model.pickData[faceId];
+    for (int faceId = 0; faceId < (int)model.cpuFaceData.size(); faceId++) {
+        const auto& faceData = model.cpuFaceData[faceId];
         // offset is in draw space (post-centering), so add it to vertices in the same adjusted space
         // equivalent to subtracting it from the ray origin per face, but cheaper to apply once to a local ray copy
-        Vector3 off = model.faceOffsets[faceId];
+        Vector3 offset = model.faceOffsets[faceId];
         Ray faceRay = ray;
-        faceRay.position.x -= off.x;
-        faceRay.position.y -= off.y;
-        faceRay.position.z -= off.z;
+        faceRay.position.x -= offset.x;
+        faceRay.position.y -= offset.y;
+        faceRay.position.z -= offset.z;
         for (int i = 0; i + 2 < (int)faceData.indices.size(); i += 3) {
             // fetch the three vertex positions for this triangle from the flat XYZ array
             int i0 = faceData.indices[i] * 3, i1 = faceData.indices[i + 1] * 3, i2 = faceData.indices[i + 2] * 3;
-            Vec3 v0 = { faceData.vertices[i0], faceData.vertices[i0 + 1], faceData.vertices[i0 + 2] };
-            Vec3 v1 = { faceData.vertices[i1], faceData.vertices[i1 + 1], faceData.vertices[i1 + 2] };
-            Vec3 v2 = { faceData.vertices[i2], faceData.vertices[i2 + 1], faceData.vertices[i2 + 2] };
-            float t = rayTriangleIntersect(faceRay, v0, v1, v2);
-            if (t > 0.0f && t < closestT) {
-                closestT = t;
+            Vec3 A = { faceData.vertices[i0], faceData.vertices[i0 + 1], faceData.vertices[i0 + 2] };
+            Vec3 B = { faceData.vertices[i1], faceData.vertices[i1 + 1], faceData.vertices[i1 + 2] };
+            Vec3 C = { faceData.vertices[i2], faceData.vertices[i2 + 1], faceData.vertices[i2 + 2] };
+            float rayDistance = rayTriangleIntersect(faceRay, A, B, C);
+            if (rayDistance > 0.0f && rayDistance < closestHitDistance) {
+                closestHitDistance = rayDistance;
                 hitFace = faceId;
             }
         }
@@ -282,8 +284,8 @@ void drawCadModel(const CadModel& model)
         material.maps[MATERIAL_MAP_DIFFUSE].color = model.colors[i];
         // per-face offset (draw-space translation) stacked on top of the centering transform
         // ex: offset=(0,1,0) -> face shifts 1 unit upward in draw space after centering
-        Vector3 off = model.faceOffsets[i];
-        Matrix faceTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), centeredTransform);
+        Vector3 offset = model.faceOffsets[i];
+        Matrix faceTransform = MatrixMultiply(MatrixTranslate(offset.x, offset.y, offset.z), centeredTransform);
         DrawMesh(model.meshes[i], material, faceTransform);
         UnloadMaterial(material); // else will leak every frame for every mesh, not the most efficient but fine at this scale
     }
@@ -296,8 +298,8 @@ static void drawSelectedFaceHighlight(const CadModel& model)
     if (model.selectedFace < 0 || model.selectedFace >= (int)model.meshes.size())
         return;
     Vector3 center = modelCenter(model);
-    Vector3 off = model.faceOffsets[model.selectedFace];
-    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), MatrixTranslate(-center.x, -center.y, -center.z));
+    Vector3 offset = model.faceOffsets[model.selectedFace];
+    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(offset.x, offset.y, offset.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
     {
         Material solidMaterial = LoadMaterialDefault();
@@ -321,8 +323,8 @@ static void drawSelectedFaceHighlight(const CadModel& model)
 static void drawSecondFaceHighlight(const CadModel& model)
 {
     Vector3 center = modelCenter(model);
-    Vector3 off = model.faceOffsets[model.secondFace];
-    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(off.x, off.y, off.z), MatrixTranslate(-center.x, -center.y, -center.z));
+    Vector3 offset = model.faceOffsets[model.secondFace];
+    Matrix centeredTransform = MatrixMultiply(MatrixTranslate(offset.x, offset.y, offset.z), MatrixTranslate(-center.x, -center.y, -center.z));
     rlDisableBackfaceCulling();
     {
         Color base = model.colors[model.secondFace];
@@ -364,7 +366,7 @@ static BoundingBox computeFaceBBox(const TessellatedFace& face, Vector3 center, 
 static float computeFaceMinDistance(
     const TessellatedFace& faceA, const TessellatedFace& faceB, Vector3 offsetA = { 0.0f, 0.0f, 0.0f }, Vector3 offsetB = { 0.0f, 0.0f, 0.0f })
 {
-    float minDistSq = std::numeric_limits<float>::max();
+    float minDistance = std::numeric_limits<float>::max();
     int countA = (int)faceA.vertices.size() / 6; // front vertices only
     int countB = (int)faceB.vertices.size() / 6;
     for (int i = 0; i < countA; i++) {
@@ -374,21 +376,21 @@ static float computeFaceMinDistance(
         float az = faceA.vertices[baseA + 2] + offsetA.z;
         for (int j = 0; j < countB; j++) {
             int baseB = j * 3;
-            float dx = ax - (faceB.vertices[baseB] + offsetB.x);
-            float dy = ay - (faceB.vertices[baseB + 1] + offsetB.y);
-            float dz = az - (faceB.vertices[baseB + 2] + offsetB.z);
+            float distanceX = ax - (faceB.vertices[baseB] + offsetB.x);
+            float distanceY = ay - (faceB.vertices[baseB + 1] + offsetB.y);
+            float distanceZ = az - (faceB.vertices[baseB + 2] + offsetB.z);
             // the sphere (your current best distance) fits inside a cube whose side equals the diameter, if you're already outside the cube on any single wall
             // then you're outside the sphere, checking one wall costs one abs
             // (which is cheaper than even a multiplication because it's just zeroing one bit of the float)
-            float eps = sqrtf(minDistSq);
-            if (std::abs(dx) >= eps || std::abs(dy) >= eps || std::abs(dz) >= eps)
+            float epsilon = sqrtf(minDistance);
+            if (std::abs(distanceX) >= epsilon || std::abs(distanceY) >= epsilon || std::abs(distanceZ) >= epsilon)
                 continue;
-            float dSq = dx * dx + dy * dy + dz * dz;
-            if (dSq < minDistSq)
-                minDistSq = dSq;
+            float distance = distanceX * distanceX + distanceY * distanceY + distanceZ * distanceZ;
+            if (distance < minDistance)
+                minDistance = distance;
         }
     }
-    return sqrtf(minDistSq);
+    return sqrtf(minDistance);
 }
 
 // computes the AABB of all faces in draw space (vertices minus center plus their current offsets),
@@ -398,15 +400,15 @@ static BoundingBox computeModelBBox(const CadModel& model, Vector3 center)
 {
     BoundingBox bbox = { { std::numeric_limits<float>::max(), std::numeric_limits<float>::max(), std::numeric_limits<float>::max() },
         { -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max(), -std::numeric_limits<float>::max() } };
-    for (int fi = 0; fi < (int)model.pickData.size(); fi++) {
-        const auto& face = model.pickData[fi];
-        Vector3 off = model.faceOffsets[fi];
+    for (int fi = 0; fi < (int)model.cpuFaceData.size(); fi++) {
+        const auto& face = model.cpuFaceData[fi];
+        Vector3 offset = model.faceOffsets[fi];
         int frontVertexCount = (int)face.vertices.size() / 6;
         for (int i = 0; i < frontVertexCount; i++) {
             int base = i * 3;
-            float x = face.vertices[base] - center.x + off.x;
-            float y = face.vertices[base + 1] - center.y + off.y;
-            float z = face.vertices[base + 2] - center.z + off.z;
+            float x = face.vertices[base] - center.x + offset.x;
+            float y = face.vertices[base + 1] - center.y + offset.y;
+            float z = face.vertices[base + 2] - center.z + offset.z;
             bbox.min.x = std::min(bbox.min.x, x);
             bbox.max.x = std::max(bbox.max.x, x);
             bbox.min.y = std::min(bbox.min.y, y);
@@ -424,20 +426,20 @@ static void drawModelBbox(const CadModel& model) { DrawBoundingBox(computeModelB
 // draws the bounding box of the selected face in orange, for planes this will be a flat rectangle, for cylinders/toruses a proper 3D box
 static void drawFaceBbox(const CadModel& model)
 {
-    if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
+    if (model.selectedFace < 0 || model.selectedFace >= (int)model.cpuFaceData.size())
         return;
-    DrawBoundingBox(computeFaceBBox(model.pickData[model.selectedFace], modelCenter(model), model.faceOffsets[model.selectedFace]), ORANGE);
+    DrawBoundingBox(computeFaceBBox(model.cpuFaceData[model.selectedFace], modelCenter(model), model.faceOffsets[model.selectedFace]), ORANGE);
 }
 
 // draws small yellow outward normal arrows per triangle of the selected face (front-face triangles only, strided to avoid clutter)
 // normalLength should be scaled to the model size, ex: diagonal * 0.03
 static void drawFaceNormals(const CadModel& model, float normalLength)
 {
-    if (model.selectedFace < 0 || model.selectedFace >= (int)model.pickData.size())
+    if (model.selectedFace < 0 || model.selectedFace >= (int)model.cpuFaceData.size())
         return;
     Vector3 center = modelCenter(model);
-    Vector3 off = model.faceOffsets[model.selectedFace];
-    const auto& faceData = model.pickData[model.selectedFace];
+    Vector3 offset = model.faceOffsets[model.selectedFace];
+    const auto& faceData = model.cpuFaceData[model.selectedFace];
     // tessGrid emits front vertices first then back vertices (same count), so front indices are all < frontVertexCount
     // we only draw normals for front-face triangles to avoid double arrows pointing in opposite directions
     int frontVertexCount = (int)faceData.vertices.size() / 3 / 2;
@@ -447,9 +449,9 @@ static void drawFaceNormals(const CadModel& model, float normalLength)
             continue;
         int i0 = faceData.indices[i] * 3, i1 = faceData.indices[i + 1] * 3, i2 = faceData.indices[i + 2] * 3;
         // triangle centroid in draw space (apply same centering as drawCadModel, plus the face's offset)
-        Vector3 triCenter = { (faceData.vertices[i0] + faceData.vertices[i1] + faceData.vertices[i2]) / 3.0f - center.x + off.x,
-            (faceData.vertices[i0 + 1] + faceData.vertices[i1 + 1] + faceData.vertices[i2 + 1]) / 3.0f - center.y + off.y,
-            (faceData.vertices[i0 + 2] + faceData.vertices[i1 + 2] + faceData.vertices[i2 + 2]) / 3.0f - center.z + off.z };
+        Vector3 triCenter = { (faceData.vertices[i0] + faceData.vertices[i1] + faceData.vertices[i2]) / 3.0f - center.x + offset.x,
+            (faceData.vertices[i0 + 1] + faceData.vertices[i1 + 1] + faceData.vertices[i2 + 1]) / 3.0f - center.y + offset.y,
+            (faceData.vertices[i0 + 2] + faceData.vertices[i1 + 2] + faceData.vertices[i2 + 2]) / 3.0f - center.z + offset.z };
         // average normal of the three vertices (analytical normals so all three are essentially identical, average is just for correctness)
         Vector3 triNormal = { (faceData.normals[i0] + faceData.normals[i1] + faceData.normals[i2]) / 3.0f,
             (faceData.normals[i0 + 1] + faceData.normals[i1 + 1] + faceData.normals[i2 + 1]) / 3.0f,
@@ -472,9 +474,9 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
 
     switch (surface.kind) {
     case SurfaceKind::Plane: {
-        // one big normal arrow from the face centroid along zDir which is the average position of all front-face vertices in draw space
+        // one big normal arrow from the face centroid along zDirection which is the average position of all front-face vertices in draw space
         // (with centering already applied), used to anchor axis/normal arrows at the visual center of the face
-        const TessellatedFace& face = model.pickData[model.selectedFace];
+        const TessellatedFace& face = model.cpuFaceData[model.selectedFace];
         int frontVertexCount = (int)face.vertices.size() / 6; // front vertices occupy the 1rst half of the flat array (2nd half is the back-face duplicates)
         Vector3 faceCentroid = { 0, 0, 0 };
         for (int i = 0; i < frontVertexCount; i++) {
@@ -484,12 +486,12 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
             faceCentroid.z += face.vertices[base + 2] - center.z + offset.z;
         }
         if (frontVertexCount > 0) {
-            float inv = 1.0f / (float)frontVertexCount;
-            faceCentroid.x *= inv;
-            faceCentroid.y *= inv;
-            faceCentroid.z *= inv;
+            float inverse = 1.0f / (float)frontVertexCount; //mult faster than div
+            faceCentroid.x *= inverse;
+            faceCentroid.y *= inverse;
+            faceCentroid.z *= inverse;
         }
-        Vec3 normal = surface.axis.zDir.norm();
+        Vec3 normal = surface.axis.zDirection.norm();
         Vector3 tip = { faceCentroid.x + (float)normal.x * scale, faceCentroid.y + (float)normal.y * scale, faceCentroid.z + (float)normal.z * scale };
         DrawLine3D(faceCentroid, tip, SKYBLUE);
         break;
@@ -500,7 +502,7 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
         // surface origin is in STEP space, apply centering then offset to get draw space
         Vector3 axisOrigin = { (float)surface.axis.origin.x - center.x + offset.x, (float)surface.axis.origin.y - center.y + offset.y,
             (float)surface.axis.origin.z - center.z + offset.z };
-        Vec3 axisDir = surface.axis.zDir.norm();
+        Vec3 axisDir = surface.axis.zDirection.norm();
         Vector3 axisStart = { axisOrigin.x - (float)axisDir.x * scale, axisOrigin.y - (float)axisDir.y * scale, axisOrigin.z - (float)axisDir.z * scale };
         Vector3 axisEnd = { axisOrigin.x + (float)axisDir.x * scale, axisOrigin.y + (float)axisDir.y * scale, axisOrigin.z + (float)axisDir.z * scale };
         DrawLine3D(axisStart, axisEnd, SKYBLUE);
@@ -512,12 +514,12 @@ static void drawFaceAnalyticalAxis(const CadModel& model, float scale)
 }
 
 // draws the area-weighted average orientation of all faces as a SKYBLUE arrow from the live model center
-// each face contributes its zDir (plane normal / cylinder+torus axis) weighted by its tessellated area
+// each face contributes its zDirection (plane normal / cylinder+torus axis) weighted by its tessellated area
 static void drawModelAverageNormal(const CadModel& model, float scale)
 {
     Vec3 weightedSum = { 0, 0, 0 };
     for (int i = 0; i < (int)model.faceSurfaces.size(); i++) {
-        Vec3 faceAxis = model.faceSurfaces[i].axis.zDir.norm();
+        Vec3 faceAxis = model.faceSurfaces[i].axis.zDirection.norm();
         float weight = (i < (int)model.faceAreas.size()) ? model.faceAreas[i] : 1.0f;
         weightedSum = weightedSum + faceAxis * weight;
     }
@@ -541,7 +543,7 @@ static void handleDefaultControls(
         Vector2 mouseDelta = GetMouseDelta();
         yaw += mouseDelta.x * 0.4f; // 0.4 deg/pixel feel-tuned for typical screen DPI
         pitch -= mouseDelta.y * 0.4f; // subtract because screen Y is flipped relative to world Y
-        // clamp with 1 degree margin off 90° so that view matrix doesn't degenerate if we go directly above/below target
+        // clamp with 1 degree margin offset 90° so that view matrix doesn't degenerate if we go directly above/below target
         if (pitch > 89.0f)
             pitch = 89.0f;
         if (pitch < -89.0f)
@@ -599,10 +601,10 @@ static void handleDefaultControls(
         showBbox = !showBbox;
 
     // decay active toasts, subtract frame time each frame and remove expired entries
-    float dt = GetFrameTime();
+    float deltaTime = GetFrameTime();
     model.toasts.erase(std::remove_if(model.toasts.begin(), model.toasts.end(),
                            [&](Toast& t) {
-                               t.timeLeft -= dt;
+                               t.timeLeft -= deltaTime;
                                return t.timeLeft <= 0.0f;
                            }),
         model.toasts.end());
@@ -612,16 +614,16 @@ static void handleDefaultControls(
 static void handle1SelectControls(CadModel& model, float diagonal)
 {
     // move selected face along its surface's own axes
-    // UP/DOWN = zDir (normal for planes, axis for cylinders/toruses), LEFT/RIGHT = xDir (in-plane tangent), PageUp/PageDown = yDir (zDir*xDir)
-    // wasTranslating detects the rising edge of a translation gesture so one continuous hold = one undo entry
+    // UP/DOWN = zDirection (normal for planes, axis for cylinders/toruses), LEFT/RIGHT = xDirection (in-plane tangent), PageUp/PageDown = yDirection
+    // (zDirection*xDirection) wasTranslating detects the rising edge of a translation gesture so one continuous hold = one undo entry
     model.translating = false;
     if (model.selectedFace > -1) {
         float step = diagonal * 0.005f;
-        const Surface& surf = model.faceSurfaces[model.selectedFace];
-        Vec3 zDir = surf.axis.zDir.norm();
-        Vec3 xDir = surf.axis.xDir.norm();
-        Vec3 yDir = zDir.cross(xDir).norm();
-        Vector3& off = model.faceOffsets[model.selectedFace];
+        const Surface& surface = model.faceSurfaces[model.selectedFace];
+        Vec3 zDirection = surface.axis.zDirection.norm();
+        Vec3 xDirection = surface.axis.xDirection.norm();
+        Vec3 yDirection = zDirection.cross(xDirection).norm();
+        Vector3& offset = model.faceOffsets[model.selectedFace];
         model.translating
             = IsKeyDown(KEY_UP) || IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_PAGE_UP) || IsKeyDown(KEY_PAGE_DOWN);
         // if we just started pressing down a translation key
@@ -630,8 +632,8 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             model.healCache = buildCylinderHealCache(model, model.selectedFace);
             model.cachedHealFace = model.selectedFace;
             // collect the set of faces down the constraints chains that will move along with the current selected face
-            Vec3 zDirSeed = model.faceSurfaces[model.selectedFace].axis.zDir.norm();
-            Vector3 unitSeed = { (float)zDirSeed.x, (float)zDirSeed.y, (float)zDirSeed.z };
+            Vec3 zDirectionSeed = model.faceSurfaces[model.selectedFace].axis.zDirection.norm();
+            Vector3 unitSeed = { (float)zDirectionSeed.x, (float)zDirectionSeed.y, (float)zDirectionSeed.z };
             auto constrainedMoves = collectConstrainedMoves(model, model.selectedFace, unitSeed);
             // build one heal cache per partner face, keyed by face index
             model.propagatedHealCaches.clear();
@@ -640,22 +642,22 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             // snapshot the pre-gesture offsets of the moving face and the ones of all faces down the constraints chains
             UndoEntry entry;
             entry.faceId = model.selectedFace;
-            entry.oldOffset = off;
+            entry.oldOffset = offset;
             for (const auto& [partnerFace, _] : constrainedMoves)
                 entry.propagatedOffsets.push_back({ partnerFace, model.faceOffsets[partnerFace] });
             // cylinder snapshot covering all faces that will move (selected + all faces down the constraints chains)
             std::vector<int> movingFaces = { model.selectedFace };
-            for (const auto& po : entry.propagatedOffsets)
-                movingFaces.push_back(po.first);
-            for (int mf : movingFaces) {
-                for (const auto& healEntry : buildCylinderHealCache(model, mf)) {
-                    bool already = false;
-                    for (const auto& snap : entry.cylSnapshots)
-                        if (snap.cylFaceId == healEntry.cylFaceId) {
-                            already = true;
+            for (const auto& propagatedOffset : entry.propagatedOffsets)
+                movingFaces.push_back(propagatedOffset.first);
+            for (int movingFace : movingFaces) {
+                for (const auto& healEntry : buildCylinderHealCache(model, movingFace)) {
+                    bool alreadySnapshotted = false;
+                    for (const auto& snapshot : entry.cylSnapshots)
+                        if (snapshot.cylFaceId == healEntry.cylFaceId) {
+                            alreadySnapshotted = true;
                             break;
                         }
-                    if (!already)
+                    if (!alreadySnapshotted)
                         entry.cylSnapshots.push_back({ healEntry.cylFaceId, model.cylHeightRanges[healEntry.cylFaceId] });
                 }
             }
@@ -669,7 +671,7 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             model.propagatedHealCaches.clear();
         }
         model.wasTranslating = model.translating;
-        Vec3 planeNormal = surf.axis.zDir.norm();
+        Vec3 planeNormal = surface.axis.zDirection.norm();
         if (!model.translating)
             model.toastPushedThisGesture = false; // show only error toast on translation key press (not on every translation frame xd)
         auto move = [&](int key, Vec3 dir) {
@@ -682,91 +684,103 @@ static void handle1SelectControls(CadModel& model, float diagonal)
                 model.toasts.push_back({ "Axial motion blocked: Distance+Symmetry lock this axis", 2.5f });
                 model.toastPushedThisGesture = true;
             }
-            off.x += delta.x;
-            off.y += delta.y;
-            off.z += delta.z;
+            offset.x += delta.x;
+            offset.y += delta.y;
+            offset.z += delta.z;
             // collect constrained moves once so we can reuse the derived deltas below without a second DFS
             auto constrainedMoves = collectConstrainedMoves(model, model.selectedFace, delta);
-            std::unordered_map<int, CylFrameSnapshot> preFrame;
-            for (const auto& pe : model.healCache)
-                preFrame.emplace(pe.cylFaceId, CylFrameSnapshot { model.cylHeightRanges[pe.cylFaceId], pe.isMaxCap });
+            // "photograph" every cylinder's current height before anything moves this frame, all healing reads
+            // from this photo so no call corrupts the starting point that the next call depends on
+            std::unordered_map<int, CylinderHeightRange> preFrame; // the photo (map of cylinder id to its height range before anything moves)
+            for (const auto& primaryEntry : model.healCache)
+                preFrame.emplace(primaryEntry.cylFaceId, model.cylHeightRanges[primaryEntry.cylFaceId]);
             for (const auto& [cacheId, cacheEntries] : model.propagatedHealCaches)
-                for (const auto& qe : cacheEntries)
-                    preFrame.emplace(qe.cylFaceId, CylFrameSnapshot { model.cylHeightRanges[qe.cylFaceId], qe.isMaxCap });
+                for (const auto& propagatedEntry : cacheEntries)
+                    preFrame.emplace(propagatedEntry.cylFaceId, model.cylHeightRanges[propagatedEntry.cylFaceId]);
 
             double primaryAxialDelta = planeNormal.x * delta.x + planeNormal.y * delta.y + planeNormal.z * delta.z;
 
-            std::unordered_map<int, Vector3> propOds;
-            std::unordered_map<int, double> propAxialDeltas;
+            // pre-compute how much each chained face moves once, so the per-cylinder loop below can just look it up
+            std::unordered_map<int, Vector3> propagatedOffsetsDeltas; // how much each chained face moves this frame as a 3D vector x y z
+            // same but only the component that goes along the cylinder axis (that stretches or shrinks the cylinder)
+            std::unordered_map<int, double> propagatedAxialDeltas;
             for (const auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-                Vector3 od = { 0, 0, 0 };
+                Vector3 offsetDelta = { 0, 0, 0 };
                 for (const auto& [face, faceDelta] : constrainedMoves)
                     if (face == cacheId) {
-                        od = faceDelta;
+                        offsetDelta = faceDelta;
                         break;
                     }
-                propOds[cacheId] = od;
-                Vec3 partnerNormal = model.faceSurfaces[cacheId].axis.zDir.norm();
-                propAxialDeltas[cacheId] = partnerNormal.x * od.x + partnerNormal.y * od.y + partnerNormal.z * od.z;
+                propagatedOffsetsDeltas[cacheId] = offsetDelta;
+                Vec3 partnerNormal = model.faceSurfaces[cacheId].axis.zDirection.norm();
+                propagatedAxialDeltas[cacheId] = partnerNormal.x * offsetDelta.x + partnerNormal.y * offsetDelta.y + partnerNormal.z * offsetDelta.z;
             }
 
-            for (auto& [cylId, snap] : preFrame) {
-                double newMin = snap.range.heightMin;
-                double newMax = snap.range.heightMax;
+            // for every cylinder in the pre-frame snapshot, accumulate cap (end circle) deltas from every
+            // cache that touches it (primary + every propagated face) and call retessCylinderFace exactly once
+            for (auto& [cylId, snapshot] : preFrame) {
+                double newMin = snapshot.heightMin;
+                double newMax = snapshot.heightMax;
                 // primary cache contribution (at most one entry per cylinder)
-                for (auto& pe : model.healCache) {
-                    if (pe.cylFaceId != cylId)
+                for (auto& primaryEntry : model.healCache) {
+                    if (primaryEntry.cylFaceId != cylId)
                         continue;
-                    double signedDelta = primaryAxialDelta * pe.axisDotNormal;
-                    if (pe.isMaxCap)
+                    double signedDelta = primaryAxialDelta * primaryEntry.axisDotNormal;
+                    if (primaryEntry.isMaxCap)
                         newMax += signedDelta;
                     else
                         newMin += signedDelta;
                     break;
                 }
+                // all propagated cache contributions one entry per cache that owns a cap (end circle) of this cylinder (so up to two)
                 for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-                    double pad = propAxialDeltas.count(cacheId) ? propAxialDeltas.at(cacheId) : 0.0;
-                    for (auto& qe : cacheEntries) {
-                        if (qe.cylFaceId != cylId)
+                    double pad = propagatedAxialDeltas.count(cacheId) ? propagatedAxialDeltas.at(cacheId) : 0.0;
+                    for (auto& propagatedEntry : cacheEntries) {
+                        if (propagatedEntry.cylFaceId != cylId)
                             continue;
-                        double signedDelta = pad * qe.axisDotNormal;
-                        if (qe.isMaxCap)
+                        double signedDelta = pad * propagatedEntry.axisDotNormal;
+                        if (propagatedEntry.isMaxCap)
                             newMax += signedDelta;
                         else
                             newMin += signedDelta;
                         break; // each face owns at most one cap of a given cylinder
                     }
                 }
+                // crossing inversion: if a moving plane passed through the opposite cap, mirror the range and flip isMaxCap on every cache entry that
+                // references this cylinder so subsequent frames within the same gesture continue healing in the correct direction,
+                // <= with epsilon so the inversion also fires when caps meet exactly (zero-height flicker guard)
                 if (newMax <= newMin + 1e-6) {
                     std::swap(newMin, newMax);
-                    for (auto& pe : model.healCache)
-                        if (pe.cylFaceId == cylId) {
-                            pe.isMaxCap = !pe.isMaxCap;
+                    for (auto& primaryEntry : model.healCache)
+                        if (primaryEntry.cylFaceId == cylId) {
+                            primaryEntry.isMaxCap = !primaryEntry.isMaxCap;
                             break;
                         }
                     for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches)
-                        for (auto& qe : cacheEntries)
-                            if (qe.cylFaceId == cylId) {
-                                qe.isMaxCap = !qe.isMaxCap;
+                        for (auto& propagatedEntry : cacheEntries)
+                            if (propagatedEntry.cylFaceId == cylId) {
+                                propagatedEntry.isMaxCap = !propagatedEntry.isMaxCap;
                                 break;
                             }
                 }
                 retessCylinderFace(model, cylId, newMin, newMax);
             }
 
+            // update offsets for all propagated faces in a separate pass, decoupled from healing so
+            // moves that don't push along the axis still shift the face offset correctly
             for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-                const Vector3& od = propOds.count(cacheId) ? propOds.at(cacheId) : Vector3 { 0, 0, 0 };
-                model.faceOffsets[cacheId].x += od.x;
-                model.faceOffsets[cacheId].y += od.y;
-                model.faceOffsets[cacheId].z += od.z;
+                const Vector3& offsetDelta = propagatedOffsetsDeltas.count(cacheId) ? propagatedOffsetsDeltas.at(cacheId) : Vector3 { 0, 0, 0 };
+                model.faceOffsets[cacheId].x += offsetDelta.x;
+                model.faceOffsets[cacheId].y += offsetDelta.y;
+                model.faceOffsets[cacheId].z += offsetDelta.z;
             }
         };
-        move(KEY_UP, zDir);
-        move(KEY_DOWN, zDir * -1.0);
-        move(KEY_RIGHT, xDir);
-        move(KEY_LEFT, xDir * -1.0);
-        move(KEY_PAGE_UP, yDir);
-        move(KEY_PAGE_DOWN, yDir * -1.0);
+        move(KEY_UP, zDirection);
+        move(KEY_DOWN, zDirection * -1.0);
+        move(KEY_RIGHT, xDirection);
+        move(KEY_LEFT, xDirection * -1.0);
+        move(KEY_PAGE_UP, yDirection);
+        move(KEY_PAGE_DOWN, yDirection * -1.0);
     } else {
         // user clicked outside model, unselecting everything so clear all
         model.wasTranslating = false;
@@ -784,16 +798,16 @@ static void handle1SelectControls(CadModel& model, float diagonal)
         UndoEntry opposite;
         opposite.faceId = entry.faceId;
         opposite.oldOffset = model.faceOffsets[entry.faceId];
-        for (const auto& snap : entry.cylSnapshots)
-            opposite.cylSnapshots.push_back({ snap.cylFaceId, model.cylHeightRanges[snap.cylFaceId] });
+        for (const auto& snapshot : entry.cylSnapshots)
+            opposite.cylSnapshots.push_back({ snapshot.cylFaceId, model.cylHeightRanges[snapshot.cylFaceId] });
         // capture current propagated offsets into the opposite stack before restoring, so redo can reverse the undo
         for (const auto& [faceId, _] : entry.propagatedOffsets)
             opposite.propagatedOffsets.push_back({ faceId, model.faceOffsets[faceId] });
         destination.push_back(std::move(opposite));
         model.faceOffsets[entry.faceId] = entry.oldOffset;
-        for (const auto& snap : entry.cylSnapshots) {
-            model.cylHeightRanges[snap.cylFaceId] = snap.oldHeight;
-            retessCylinderFace(model, snap.cylFaceId, snap.oldHeight.heightMin, snap.oldHeight.heightMax);
+        for (const auto& snapshot : entry.cylSnapshots) {
+            model.cylHeightRanges[snapshot.cylFaceId] = snapshot.oldHeight;
+            retessCylinderFace(model, snapshot.cylFaceId, snapshot.oldHeight.heightMin, snapshot.oldHeight.heightMax);
         }
         // restore the offsets of faces down the constraints chains that got moved by propagation during this gesture
         for (const auto& [faceId, oldOffset] : entry.propagatedOffsets)
@@ -812,12 +826,12 @@ static void handle1SelectControls(CadModel& model, float diagonal)
 static void handle2SelectControls(CadModel& model)
 {
     if (!model.translating && model.selectedFace > -1 && model.secondFace > -1) {
-        int fA = std::min(model.selectedFace, model.secondFace); // always fA < fB so pair lookup is a simple/fast equality check
-        int fB = std::max(model.selectedFace, model.secondFace);
+        int faceA = std::min(model.selectedFace, model.secondFace); // always faceA < faceB so pair lookup is a simple/fast equality check
+        int faceB = std::max(model.selectedFace, model.secondFace);
         auto pushToast = [&](const std::string& msg) { model.toasts.push_back({ msg, 3.0f }); };
-        auto findPairId = [&]() -> int { // returns the index of the existing pair for fA-fB or -1 if none
+        auto findPairId = [&]() -> int { // returns the index of the existing pair for faceA-faceB or -1 if none
             for (int i = 0; i < (int)model.constraints.size(); i++)
-                if (model.constraints[i].faceA == fA && model.constraints[i].faceB == fB)
+                if (model.constraints[i].faceA == faceA && model.constraints[i].faceB == faceB)
                     return i;
             return -1;
         };
@@ -828,7 +842,7 @@ static void handle2SelectControls(CadModel& model)
             bool active = constraintPair
                 && ((kind == ConstraintKind::Distance && constraintPair->hasDistance) || (kind == ConstraintKind::Symmetry && constraintPair->hasSymmetry));
             if (active) {
-                // toggle off (clear the kind, remove the entry entirely if no kinds remain)
+                // toggle offset (clear the kind, remove the entry entirely if no kinds remain)
                 if (kind == ConstraintKind::Distance)
                     constraintPair->hasDistance = false;
                 else
@@ -837,25 +851,61 @@ static void handle2SelectControls(CadModel& model)
                     model.constraints.erase(model.constraints.begin() + id);
                 return;
             }
+            // only plane faces can be paired with constraints
+            if (model.faceSurfaces[faceA].kind != SurfaceKind::Plane || model.faceSurfaces[faceB].kind != SurfaceKind::Plane) {
+                pushToast("Constraints require both selected faces to be planes");
+                return;
+            }
             if (!constraintPair && (int)model.constraints.size() >= 20) {
                 pushToast("Constraint limit reached (max 20 pairs)");
                 return;
             }
+            // just checking if faceA-faceB pair has S+D isn't enough, we need to walk the constraint graph from faceA,
+            // skip any existing direct faceA-faceB pair, if faceB is reachable via other intermediate faces then this constraint closes a cycle
+            // any closed cycle of Distance and/or Symmetry constraints on a 1D axis is either redundant or over-constraining
+            // ex: faceA D faceB, faceB S faceC, faceA D faceC
+            std::vector<int> cycleVisited = { faceA }; // what we have already seen
+            std::vector<int> cycleQueue = { faceA }; // what to process next
+            int cycleWorkId = 0;
+            bool cycleFound = false;
+            while (cycleWorkId < (int)cycleQueue.size() && !cycleFound) {
+                int cycleCurrent = cycleQueue[cycleWorkId++];
+                for (const auto& constraintPair : model.constraints) {
+                    if (constraintPair.faceA != cycleCurrent && constraintPair.faceB != cycleCurrent)
+                        continue;
+                    // skip the existing direct faceA-faceB pair so adding a second kind to it does not falsely trigger
+                    if ((constraintPair.faceA == faceA && constraintPair.faceB == faceB) || (constraintPair.faceA == faceB && constraintPair.faceB == faceA))
+                        continue;
+                    int cycleOther = (constraintPair.faceA == cycleCurrent) ? constraintPair.faceB : constraintPair.faceA;
+                    if (cycleOther == faceB) {
+                        cycleFound = true;
+                        break;
+                    }
+                    if (std::find(cycleVisited.begin(), cycleVisited.end(), cycleOther) != cycleVisited.end())
+                        continue;
+                    cycleVisited.push_back(cycleOther);
+                    cycleQueue.push_back(cycleOther);
+                }
+                if (cycleFound) {
+                    pushToast("Cycle detected: this constraint would over-constrain the model");
+                    return;
+                }
+            }
             // create the pair entry if it does not exist yet
             if (!constraintPair) {
                 ConstraintPair newPair;
-                newPair.faceA = fA;
-                newPair.faceB = fB;
+                newPair.faceA = faceA;
+                newPair.faceB = faceB;
                 model.constraints.push_back(newPair);
                 constraintPair = &model.constraints.back();
             }
             if (kind == ConstraintKind::Distance) {
                 constraintPair->hasDistance = true;
-                constraintPair->targetDistance = computeCentroidDistance(model, fA, fB);
+                constraintPair->targetDistance = computeCentroidDistance(model, faceA, faceB);
             } else {
                 constraintPair->hasSymmetry = true;
-                float posA = computeAxialPos(model, fA, fA);
-                float posB = computeAxialPos(model, fB, fA);
+                float posA = computeAxialPos(model, faceA, faceA);
+                float posB = computeAxialPos(model, faceB, faceA);
                 constraintPair->symmetryMidpoint = (posA + posB) * 0.5f;
             }
         };
@@ -899,31 +949,31 @@ static void drawConstraintPanel(const CadModel& model)
     panelY += 20; // header height, keep in sync with handleControls click detection
 
     for (int i = 0; i < (int)model.constraints.size(); i++) {
-        const ConstraintPair& cp = model.constraints[i];
+        const ConstraintPair& constraintPair = model.constraints[i];
         Rectangle entryRect = { (float)panelX, (float)panelY, (float)panelWidth, (float)entryH };
         bool hovered = CheckCollisionPointRec(mouse, entryRect);
         Color bgColor = hovered ? Color { 55, 55, 68, 210 } : Color { 32, 32, 44, 190 };
         DrawRectangleRec(entryRect, bgColor);
 
-        int cx = panelX + 6;
-        int cy = panelY + 6;
+        int constraintX = panelX + 6;
+        int constraintY = panelY + 6;
         // face A id
-        const char* faceAStr = TextFormat("#%d", cp.faceA);
-        DrawText(faceAStr, cx, cy, 14, LIGHTGRAY);
-        cx += MeasureText(faceAStr, 14) + 5;
+        const char* faceAStr = TextFormat("#%d", constraintPair.faceA);
+        DrawText(faceAStr, constraintX, constraintY, 14, LIGHTGRAY);
+        constraintX += MeasureText(faceAStr, 14) + 5;
         // kind icons, 13x14 colored squares with a single letter, stacked horizontally
-        if (cp.hasDistance) {
-            DrawRectangle(cx, cy, 13, 14, ORANGE);
-            DrawText("D", cx + 2, cy + 1, 12, BLACK);
-            cx += 17;
+        if (constraintPair.hasDistance) {
+            DrawRectangle(constraintX, constraintY, 13, 14, ORANGE);
+            DrawText("D", constraintX + 2, constraintY + 1, 12, BLACK);
+            constraintX += 17;
         }
-        if (cp.hasSymmetry) {
-            DrawRectangle(cx, cy, 13, 14, SKYBLUE);
-            DrawText("S", cx + 2, cy + 1, 12, BLACK);
-            cx += 17;
+        if (constraintPair.hasSymmetry) {
+            DrawRectangle(constraintX, constraintY, 13, 14, SKYBLUE);
+            DrawText("S", constraintX + 2, constraintY + 1, 12, BLACK);
+            constraintX += 17;
         }
         // face B id
-        DrawText(TextFormat("#%d", cp.faceB), cx + 4, cy, 14, LIGHTGRAY);
+        DrawText(TextFormat("#%d", constraintPair.faceB), constraintX + 4, constraintY, 14, LIGHTGRAY);
 
         panelY += entryH + entryGap;
     }
@@ -935,13 +985,13 @@ static void drawToasts(const CadModel& model)
 {
     int screenW = GetScreenWidth();
     int toastY = GetScreenHeight() - 54;
-    for (const auto& t : model.toasts) {
-        float fading = t.timeLeft < 0.5f ? t.timeLeft / 0.5f : 1.0f;
+    for (const auto& toast : model.toasts) {
+        float fading = toast.timeLeft < 0.5f ? toast.timeLeft / 0.5f : 1.0f;
         unsigned char alpha = (unsigned char)(fading * 230);
-        int textW = MeasureText(t.message.c_str(), 16);
+        int textW = MeasureText(toast.message.c_str(), 16);
         int toastX = (screenW - textW) / 2 - 10;
         DrawRectangle(toastX, toastY - 5, textW + 20, 28, Color { 30, 30, 42, alpha });
-        DrawText(t.message.c_str(), toastX + 10, toastY, 16, Color { 255, 220, 80, alpha });
+        DrawText(toast.message.c_str(), toastX + 10, toastY, 16, Color { 255, 220, 80, alpha });
         toastY -= 36; // stack upward when multiple toasts are active
     }
 }
@@ -996,14 +1046,14 @@ static void drawUI(const CadModel& model)
     // block 3
     if (model.selectedFace > -1) {
         int faceId = model.selectedFace;
-        int frontTris = (int)model.pickData[faceId].indices.size() / 6;
-        DrawText(TextFormat(
-                     "Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceId, nameForKind(model.pickData[faceId].kind), frontTris, model.faceAreas[faceId]),
+        int frontTriangles = (int)model.cpuFaceData[faceId].indices.size() / 6;
+        DrawText(TextFormat("Face #%d [%s]\nTriangles: %d\nSurface: %.2f mm^2", faceId, nameForKind(model.cpuFaceData[faceId].kind), frontTriangles,
+                     model.faceAreas[faceId]),
             20, uiY, 16, paleYellow);
         uiY += uiStep * 3;
 
         Vector3 center = modelCenter(model);
-        BoundingBox faceBbox = computeFaceBBox(model.pickData[faceId], center, model.faceOffsets[faceId]);
+        BoundingBox faceBbox = computeFaceBBox(model.cpuFaceData[faceId], center, model.faceOffsets[faceId]);
         DrawText(TextFormat("Width: %.2f\nHeight: %.2f\nDepth: %.2f mm", faceBbox.max.x - faceBbox.min.x, faceBbox.max.y - faceBbox.min.y,
                      faceBbox.max.z - faceBbox.min.z),
             20, uiY, 16, paleYellow);
@@ -1023,14 +1073,18 @@ static void drawUI(const CadModel& model)
 
     // block 4
     if (model.selectedFace > -1 && model.secondFace > -1) {
-        float dist = computeFaceMinDistance(
-            model.pickData[model.selectedFace], model.pickData[model.secondFace], model.faceOffsets[model.selectedFace], model.faceOffsets[model.secondFace]);
+        float dist = computeFaceMinDistance(model.cpuFaceData[model.selectedFace], model.cpuFaceData[model.secondFace], model.faceOffsets[model.selectedFace],
+            model.faceOffsets[model.secondFace]);
         DrawText(TextFormat("Distance to #%d: %.4f mm", model.secondFace, dist), 20, uiY, 16, paleOrange);
         uiY += uiStep;
-        DrawText("D = distance constraint", 20, uiY, 16, paleOrange);
-        uiY += uiStep;
-        DrawText("S = symmetry constraint", 20, uiY, 16, paleOrange);
-        uiY += uiStep;
+        // only planes can form constraints, show the hints only when both selections qualify
+        bool bothPlanes = model.faceSurfaces[model.selectedFace].kind == SurfaceKind::Plane && model.faceSurfaces[model.secondFace].kind == SurfaceKind::Plane;
+        if (bothPlanes) {
+            DrawText("D = distance constraint", 20, uiY, 16, paleOrange);
+            uiY += uiStep;
+            DrawText("S = symmetry constraint", 20, uiY, 16, paleOrange);
+            uiY += uiStep;
+        }
     }
 
     // drawn last so they render on top of all other UI
@@ -1082,7 +1136,7 @@ CadModel loadStep(const std::string& path, int arcSegs)
         // all parallel SoA arrays stay in sync, one entry per successfully uploaded face
         model.meshes.push_back(mesh);
         model.colors.push_back(colorForKind(tessellatedFace.kind));
-        model.pickData.push_back(tessellatedFace);
+        model.cpuFaceData.push_back(tessellatedFace);
         model.faceSurfaces.push_back(faceSurface);
         model.faceAreas.push_back(computeFaceArea(tessellatedFace));
         model.faceOffsets.push_back({ 0.0f, 0.0f, 0.0f });

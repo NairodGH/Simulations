@@ -35,20 +35,20 @@ struct Vec2 {
 
 // STEP AXIS2_PLACEMENT_3D
 struct AxisPlacement {
-    Vec3 origin, zDir, xDir;
+    Vec3 origin, zDirection, xDirection;
 };
 
 // surface types we handle
 enum class SurfaceKind { Plane, Cylinder, Torus, Unknown };
 
 // holds everything needed to evaluate any of the three supported surface types at any point.
-// plane:    no radii, origin = any point on the plane, zDir = surface normal,
-//           xDir = one tangent direction (yDir is cross product, making up the full plane coord system)
-// cylinder: origin = any point on the axis, zDir = axis direction,
-//           xDir = zero-angle reference (where u=0 starts sweeping around)
+// plane:    no radii, origin = any point on the plane, zDirection = surface normal,
+//           xDirection = one tangent direction (yDir is cross product, making up the full plane coord system)
+// cylinder: origin = any point on the axis, zDirection = axis direction,
+//           xDirection = zero-angle reference (where u=0 starts sweeping around)
 //           majorRadius = distance from axis to surface
-// torus:    picture a donut, origin = center of the hole, zDir = axis through the hole
-//           xDir = direction where u=0 starts (irrelevant for a full donut, matters for fillet patches)
+// torus:    picture a donut, origin = center of the hole, zDirection = axis through the hole
+//           xDirection = direction where u=0 starts (irrelevant for a full donut, matters for fillet patches)
 //           majorRadius = distance from donut center to tube centerline (size of the hole)
 //           minorRadius = radius of the tube itself (thickness of the dough) from where majorRadius ends up
 //           torus minorRadius plays the same role as cylinder majorRadius
@@ -109,11 +109,6 @@ struct CylinderHealEntry {
     double axisDotNormal; // dot(cylAxis, planeNormal) = about 1, preserves sign for signedDelta each frame
 };
 
-struct CylFrameSnapshot {
-    CylinderHeightRange range;
-    bool isMaxCap;
-};
-
 enum class ConstraintKind { Distance, Symmetry };
 
 // one active constraint pairing between two faces
@@ -141,7 +136,7 @@ struct CadModel {
     std::vector<Color> colors;
 
     // SoA per face
-    std::vector<TessellatedFace> pickData; // CPU copy kept after GPU upload, for mouse ray picking and analysis
+    std::vector<TessellatedFace> cpuFaceData; // CPU copy kept after GPU upload, for mouse ray picking and analysis
     std::vector<Surface> faceSurfaces; // analytical surface definition per face, for axis/normal display
     std::vector<float> faceAreas;
     std::vector<Vector3> faceOffsets; // per-face translation in draw space, applied on top of the centering transform at draw/query time
@@ -191,14 +186,12 @@ struct CadModel {
 CadModel loadStep(const std::string& path, int arcSegs = 48);
 void drawCadModel(const CadModel& model);
 
-// parser utils
+// parser.cpp
 std::vector<std::string> splitTopLevel(const std::string& input);
 std::string trimWS(const std::string& input);
 std::string unwrap(const std::string& input);
 int stepRef(const std::string& input);
 double dbl(const std::string& input);
-
-// parser.cpp
 StepMap parseStepFile(const std::string& path);
 Vec3 resolvePoint(int id, const StepMap& map);
 AxisPlacement resolveAxis(int id, const StepMap& map);
@@ -206,8 +199,7 @@ Surface resolveSurface(int id, const StepMap& map);
 BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs);
 
 // tessellator.cpp
-TessellatedFace tessellateAdvancedFace(
-    int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
+TessellatedFace tessellateAdvancedFace(int faceId, const StepMap& map, int arcSegs, Surface* outSurface = nullptr, CylinderHeightRange* outHeightRange = nullptr);
 float computeFaceArea(const TessellatedFace& face);
 Mesh uploadMesh(const TessellatedFace& tessellatedFace);
 void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax);

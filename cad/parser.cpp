@@ -138,15 +138,15 @@ AxisPlacement resolveAxis(int id, const StepMap& map)
         throw std::runtime_error("AXIS2_PLACEMENT_3D missing at #" + std::to_string(id));
     // AXIS2_PLACEMENT_3D params: (name, origin_ref, z_dir_ref, x_dir_ref)
     // z and x direction refs point to DIRECTION entities (which share the CARTESIAN_POINT layout)
-    // ex: "('', #10, #11, #12)" -> origin=point[10], zDir=point[11], xDir=point[12]
+    // ex: "('', #10, #11, #12)" -> origin=point[10], zDirection=point[11], xDirection=point[12]
     auto params = splitTopLevel(entityIt->second.params);
     if (params.size() < 3)
         throw std::runtime_error("AXIS2_PLACEMENT_3D missing params at #" + std::to_string(id));
     AxisPlacement axis;
     axis.origin = resolvePoint(stepRef(params[1]), map);
-    axis.zDir = resolvePoint(stepRef(params[2]), map);
+    axis.zDirection = resolvePoint(stepRef(params[2]), map);
     if (params.size() >= 4)
-        axis.xDir = resolvePoint(stepRef(params[3]), map);
+        axis.xDirection = resolvePoint(stepRef(params[3]), map);
     return axis;
 }
 
@@ -154,7 +154,7 @@ Surface resolveSurface(int id, const StepMap& map)
 {
     auto entityIt = map.find(id);
     if (entityIt == map.end())
-        return {};
+        return { };
     Surface surface;
     auto params = splitTopLevel(entityIt->second.params);
     if (entityIt->second.type == "PLANE") {
@@ -203,7 +203,7 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
         return { startPt, endPt };
     AxisPlacement placement = resolveAxis(stepRef(params[1]), map);
     double radius = dbl(params[2]);
-    Vec3 O = placement.origin, Z = placement.zDir.norm(), X = placement.xDir.norm(), Y = Z.cross(X).norm();
+    Vec3 O = placement.origin, Z = placement.zDirection.norm(), X = placement.xDirection.norm(), Y = Z.cross(X).norm();
 
     // returns the angle of point in the circle's local XY plane (atan2 in [-pi, pi])
     // ex: point on the +X side -> 0.0,  point on the +Y side -> pi/2
@@ -444,10 +444,10 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
         auto resolveVertex = [&](int vertexId) -> Vec3 {
             auto vertexIt = map.find(vertexId);
             if (vertexIt == map.end() || vertexIt->second.type != "VERTEX_POINT")
-                return {};
+                return { };
             // VERTEX_POINT params: (name, cartesian_point_ref), ex: "( 'NONE', #2929 )" -> position = point[2929]
             auto vertexParams = splitTopLevel(vertexIt->second.params);
-            return (vertexParams.size() >= 2) ? resolvePoint(stepRef(vertexParams[1]), map) : Vec3 {};
+            return (vertexParams.size() >= 2) ? resolvePoint(stepRef(vertexParams[1]), map) : Vec3 { };
         };
         Vec3 vertexStart = resolveVertex(startVertexId), vertexEnd = resolveVertex(endVertexId);
         // swap start/end to match the traversal direction of this oriented edge
