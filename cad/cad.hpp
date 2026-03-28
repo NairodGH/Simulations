@@ -212,4 +212,5 @@ float computeFaceArea(const TessellatedFace& face);
 Mesh uploadMesh(const TessellatedFace& tessellatedFace);
 void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax);
 std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceId);
+void snapCylinderHealCache(CadModel& model, const std::vector<CylinderHealEntry>& cache, int planeFaceId);
 void applyCylinderHealCache(CadModel& model, std::vector<CylinderHealEntry>& cache, Vec3 planeNormal, Vector3 delta);

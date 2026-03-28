@@ -624,6 +624,10 @@ Mesh uploadMesh(const TessellatedFace& tessellatedFace)
 // the CPU cpuFaceData is also replaced so ray picking and stats remain accurate
 void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double newHeightMax)
 {
+    // zero or negative height produces coplanar triangles with undefined normals (degenerate mesh),
+    // this can happen when simultaneous two-sided compression (symetry constraint) meets in a single step, clamp before any geometry work
+    if (newHeightMax - newHeightMin < 1e-3)
+        newHeightMax = newHeightMin + 1e-3;
     const Surface& surface = model.faceSurfaces[cylId];
     Vec3 origin = surface.axis.origin, Z = surface.axis.zDirection.norm(), X = surface.axis.xDirection.norm();
     Vec3 Y = Z.cross(X).norm();
@@ -801,14 +805,11 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
         if (std::abs(planeProjectionHeight - cylHeightRange.heightMin) >= axialEps && std::abs(planeProjectionHeight - cylHeightRange.heightMax) >= axialEps)
             continue;
 
-        // radial check: at least one vertex of the plane must lie within the cylinder's cross-section,
-        // centroid-based would falsely reject inner (hole-connected) cylinders on multi-hole faces because
-        // the centroid sits at the outer-ring center, far from every hole axis, while the hole-edge vertices
-        // are right at the cylinder radius by construction, per-vertex is safe here because this runs only
+        // at least one vertex of the plane must lie within the cylinder's cross-section, per-vertex is safe here because this runs only
         // once per gesture start and planeOff is purely axial so STEP-space vertex positions are sufficient,
-        // radialEps is kept tight (just enough for floating-point snap) so a cylinder whose axis sits at a
-        // different radial position does not get grabbed just because a stray outer-ring vertex projects inside it
-        const double radialEps = 0.05; // in model units, much tighter than axialEps
+        // only accept vertices whose radial distance from the cylinder axis is near the cylinder's own surface
+        const double radialUpperEps = 0.05; // in model units
+        const double radialLowerEps = 0.10; // slightly wider lower margin to tolerate retessellation snap on the inner edge
         bool anyVertexInCrossSection = false;
         for (int vId = 0; vId < planeCount && !anyVertexInCrossSection; vId++) {
             int base = vId * 3;
@@ -816,7 +817,8 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
                 (double)model.cpuFaceData[planeFaceId].vertices[base + 1] - cylSurf.axis.origin.y,
                 (double)model.cpuFaceData[planeFaceId].vertices[base + 2] - cylSurf.axis.origin.z };
             Vec3 radialVert = toVert - cylAxis * toVert.dot(cylAxis);
-            if (radialVert.len() <= cylSurf.majorRadius + radialEps)
+            double radialDist = radialVert.len();
+            if (radialDist >= cylSurf.majorRadius - radialLowerEps && radialDist <= cylSurf.majorRadius + radialUpperEps)
                 anyVertexInCrossSection = true;
         }
         if (!anyVertexInCrossSection)
@@ -830,6 +832,50 @@ std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int
         cache.push_back({ cylId, isMaxCap, axisAlignment });
     }
     return cache;
+}
+
+// resets the axial drift that accumulates between gestures, writes the plane's exact current projection directly into cylHeightRanges for every cylinder
+// in the cache, so the next buildCylinderHealCache starts from zero drift regardless of how many gestures preceded this one, called once at gesture start after
+// buildCylinderHealCache
+void snapCylinderHealCache(CadModel& model, const std::vector<CylinderHealEntry>& cache, int planeFaceId)
+{
+    if (planeFaceId < 0 || planeFaceId >= (int)model.faceSurfaces.size())
+        return;
+    const Surface& planeSurf = model.faceSurfaces[planeFaceId];
+    if (planeSurf.kind != SurfaceKind::Plane)
+        return;
+
+    Vec3 planeNormal = planeSurf.axis.zDirection.norm();
+    const Vector3& planeOff = model.faceOffsets[planeFaceId];
+
+    // recompute the plane centroid from current CPU vertex data (same as buildCylinderHealCache)
+    Vec3 planeCent = { 0, 0, 0 };
+    int planeCount = (int)model.cpuFaceData[planeFaceId].vertices.size() / 6;
+    for (int vId = 0; vId < planeCount; vId++) {
+        int base = vId * 3;
+        planeCent.x += model.cpuFaceData[planeFaceId].vertices[base];
+        planeCent.y += model.cpuFaceData[planeFaceId].vertices[base + 1];
+        planeCent.z += model.cpuFaceData[planeFaceId].vertices[base + 2];
+    }
+    if (planeCount > 0) {
+        double inv = 1.0 / planeCount;
+        planeCent = { planeCent.x * inv, planeCent.y * inv, planeCent.z * inv };
+    }
+
+    for (const auto& entry : cache) {
+        const Surface& cylSurf = model.faceSurfaces[entry.cylFaceId];
+        Vec3 cylAxis = cylSurf.axis.zDirection.norm();
+        Vec3 toCentroid = { planeCent.x - cylSurf.axis.origin.x, planeCent.y - cylSurf.axis.origin.y, planeCent.z - cylSurf.axis.origin.z };
+        double planeOffset = cylAxis.dot(planeOff);
+        double exactProjection = toCentroid.dot(cylAxis) + planeOffset;
+
+        CylinderHeightRange& range = model.cylHeightRanges[entry.cylFaceId];
+        // overwrite the cap this entry owns with the plane's exact current projection, zeroing any drift
+        if (entry.isMaxCap)
+            range.heightMax = exactProjection;
+        else
+            range.heightMin = exactProjection;
+    }
 }
 
 // applies the cached heal entries for one frame, extends each recorded cylinder cap by the axial component of delta

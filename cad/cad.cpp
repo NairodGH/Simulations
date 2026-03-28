@@ -605,14 +605,19 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             // always rebuild at every gesture start so connectivity is re-evaluated at the plane's current position
             model.healCache = buildCylinderHealCache(model, model.selectedFace);
             model.cachedHealFace = model.selectedFace;
+            // snap cylinder height ranges to the plane's exact current position so drift accumulated
+            // from prior gestures does not push the next buildCylinderHealCache's planeProjectionHeight outside axialEps and silently lose the connection
+            snapCylinderHealCache(model, model.healCache, model.selectedFace);
             // collect the set of faces down the constraints chains that will move along with the current selected face
             Vec3 zDirectionSeed = model.faceSurfaces[model.selectedFace].axis.zDirection.norm();
             Vector3 unitSeed = { (float)zDirectionSeed.x, (float)zDirectionSeed.y, (float)zDirectionSeed.z };
             auto constrainedMoves = collectConstrainedMoves(model, model.selectedFace, unitSeed);
             // build one heal cache per partner face, keyed by face index
             model.propagatedHealCaches.clear();
-            for (const auto& [partnerFace, _] : constrainedMoves)
+            for (const auto& [partnerFace, _] : constrainedMoves) {
                 model.propagatedHealCaches[partnerFace] = buildCylinderHealCache(model, partnerFace);
+                snapCylinderHealCache(model, model.propagatedHealCaches[partnerFace], partnerFace);
+            }
             // snapshot the pre-gesture offsets of the moving face and the ones of all faces down the constraints chains
             UndoEntry entry;
             entry.faceId = model.selectedFace;
@@ -693,28 +698,39 @@ static void handle1SelectControls(CadModel& model, float diagonal)
             for (auto& [cylId, snapshot] : preFrame) {
                 double newMin = snapshot.heightMin;
                 double newMax = snapshot.heightMax;
+                // track which cap (0=min, 1=max) has already been claimed for this cylinder so a second
+                // cache entry pointing to the same capdoes not apply its delta twice and cause runaway geometry
+                bool capClaimed[2] = { false, false }; // [0]=minCap claimed, [1]=maxCap claimed
                 // primary cache contribution (at most one entry per cylinder)
                 for (auto& primaryEntry : model.healCache) {
                     if (primaryEntry.cylFaceId != cylId)
                         continue;
-                    double signedDelta = primaryAxialDelta * primaryEntry.axisDotNormal;
-                    if (primaryEntry.isMaxCap)
-                        newMax += signedDelta;
-                    else
-                        newMin += signedDelta;
+                    int capIdx = primaryEntry.isMaxCap ? 1 : 0;
+                    if (!capClaimed[capIdx]) {
+                        capClaimed[capIdx] = true;
+                        double signedDelta = primaryAxialDelta * primaryEntry.axisDotNormal;
+                        if (primaryEntry.isMaxCap)
+                            newMax += signedDelta;
+                        else
+                            newMin += signedDelta;
+                    }
                     break;
                 }
                 // all propagated cache contributions one entry per cache that owns a cap (end circle) of this cylinder (so up to two)
                 for (auto& [cacheId, cacheEntries] : model.propagatedHealCaches) {
-                    double pad = propagatedAxialDeltas.count(cacheId) ? propagatedAxialDeltas.at(cacheId) : 0.0;
+                    double propagatedAxialDelta = propagatedAxialDeltas.count(cacheId) ? propagatedAxialDeltas.at(cacheId) : 0.0;
                     for (auto& propagatedEntry : cacheEntries) {
                         if (propagatedEntry.cylFaceId != cylId)
                             continue;
-                        double signedDelta = pad * propagatedEntry.axisDotNormal;
-                        if (propagatedEntry.isMaxCap)
-                            newMax += signedDelta;
-                        else
-                            newMin += signedDelta;
+                        int capIdx = propagatedEntry.isMaxCap ? 1 : 0;
+                        if (!capClaimed[capIdx]) {
+                            capClaimed[capIdx] = true;
+                            double signedDelta = propagatedAxialDelta * propagatedEntry.axisDotNormal;
+                            if (propagatedEntry.isMaxCap)
+                                newMax += signedDelta;
+                            else
+                                newMin += signedDelta;
+                        }
                         break; // each face owns at most one cap of a given cylinder
                     }
                 }
