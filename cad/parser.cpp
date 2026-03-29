@@ -63,6 +63,56 @@ double dbl(const std::string& input)
     }
 }
 
+// STEP compound entities use the form #ID =( TYPE1 (params) TYPE2 (params) ... ); where each listed type contributes its own slice of attributes,
+// this scans the inner body character-by-character and returns a map of typename -> raw params string for each component found,
+// balanced paren tracking ensures inner nested lists (ex: control point refs "(#1,#2,#3)") are captured as one blob and never re-scanned,
+// ex: body " BOUNDED_CURVE ( )  B_SPLINE_CURVE ( 2, (#1,#2), .F., .F., .F. )  CURVE ( ) " ->
+//     { "BOUNDED_CURVE": "", "B_SPLINE_CURVE": " 2, (#1,#2), .F., .F., .F. ", "CURVE": "" }
+static std::unordered_map<std::string, std::string> extractCompoundComponents(const std::string& body)
+{
+    std::unordered_map<std::string, std::string> result;
+    int n = (int)body.size(), i = 0;
+    while (i < n) {
+        // skip any whitespace between components
+        while (i < n && (body[i] == ' ' || body[i] == '\t' || body[i] == '\r' || body[i] == '\n'))
+            i++;
+        if (i >= n)
+            break;
+        // an identifier starts with an uppercase letter, then any mix of uppercase letters, digits, and underscores like "AXIS2_PLACEMENT_3D"
+        if (!std::isupper((unsigned char)body[i])) {
+            i++;
+            continue;
+        }
+        int nameStart = i;
+        while (i < n && (std::isupper((unsigned char)body[i]) || std::isdigit((unsigned char)body[i]) || body[i] == '_'))
+            i++;
+        std::string typeName = body.substr(nameStart, i - nameStart);
+        // skip whitespace between the type name and its opening parenthesis, can't use trimWS because we are walking a character index inside a larger string
+        while (i < n && (body[i] == ' ' || body[i] == '\t'))
+            i++;
+        // each valid component is immediately followed by (, anything else (ex: a stray word inside a quoted string that already got consumed) is skipped
+        if (i >= n || body[i] != '(') {
+            continue;
+        }
+        // balance-track from ( to find the matching ) for this component's param list, handles nested lists correctly
+        int parenStart = i + 1;
+        int depth = 1;
+        i++;
+        while (i < n && depth > 0) {
+            if (body[i] == '(')
+                depth++;
+            else if (body[i] == ')')
+                depth--;
+            if (depth > 0)
+                i++;
+        }
+        // i is now at the closing ), store this component then step past it
+        result[typeName] = body.substr(parenStart, i - parenStart);
+        i++;
+    }
+    return result;
+}
+
 StepMap parseStepFile(const std::string& path)
 {
     std::ifstream file(path);
@@ -77,6 +127,12 @@ StepMap parseStepFile(const std::string& path)
     //   group 3 = raw parameter string,  ex: "'',( 1.0, 2.0, 3.0)"
     // ex full match: "#12 = CARTESIAN_POINT('', (1.0, 2.0, 3.0));"
     static std::regex entityRegex(R"(#(\d+)\s*=\s*([A-Z0-9_]+)\s*\((.+)\)\s*;$)");
+    // matches STEP compound entities, which list multiple supertypes inline instead of a single type name:
+    //   group 1 = numeric ID, group 2 = everything between the outer ( and ) of the compound
+    // ex: "#87 =( BOUNDED_CURVE ( )  B_SPLINE_CURVE ( 2, (#1,#2), .F., .F., .F. )  ... );"
+    // the simple regex above fails for these because [A-Z0-9_]+ cannot match the ( immediately after =,
+    // so we only try the compound regex when the simple one does not match
+    static std::regex compoundEntityRegex(R"(#(\d+)\s*=\s*\((.+)\)\s*;$)");
     while (std::getline(file, line)) {
         std::string trimmedLine = trimWS(line);
         // all we care about is between "DATA;" and "ENDSEC;", skip if not (metadata)
@@ -103,6 +159,34 @@ StepMap parseStepFile(const std::string& path)
             std::smatch match;
             if (std::regex_search(accumulator, match, entityRegex))
                 entityMap[std::stoi(match[1])] = { match[2], match[3] };
+            else if (std::regex_search(accumulator, match, compoundEntityRegex)) {
+                // compound entity, decompose into typed components and synthesize a single StepEntity for downstream resolvers
+                // currently handled compounds (ordered by priority):
+                //   RATIONAL_B_SPLINE_CURVE: merges B_SPLINE_CURVE (degree, ctrl_pts) + B_SPLINE_CURVE_WITH_KNOTS (multiplicities, knots) +
+                //       RATIONAL_B_SPLINE_CURVE (weights) into one params string that sampleBSpline can parse without any interface change
+                //   B_SPLINE_CURVE_WITH_KNOTS: same merge without weights, stored under that type for non-rational splines
+                //   AXIS2_PLACEMENT_3D: compound axis placements (CAD exporters sometimes wrap them in PLACEMENT, REPRESENTATION_ITEM supertypes)
+                //       are reduced to their AXIS2_PLACEMENT_3D component which resolveAxis already knows how to read
+                // unrecognised compound types land in none of these branches and are silently left out of the map,
+                // any face that references them will fall through to SurfaceKind::Unknown and be skipped at tessellation time
+                auto components = extractCompoundComponents(match[2]);
+                std::string entityType, entityParams;
+                if (components.count("B_SPLINE_CURVE") && components.count("B_SPLINE_CURVE_WITH_KNOTS")) {
+                    // synthesise unified params: '', <B_SPLINE_CURVE: degree,ctrl_pts,form,closed,self_intersect>,
+                    //     <B_SPLINE_CURVE_WITH_KNOTS: multiplicities,unique_knots,knot_spec>[, <RATIONAL_B_SPLINE_CURVE: weights>]
+                    // this layout matches the existing sampleBSpline param indexing (degree at [1], ctrl_pts at [2],
+                    // then float lists from [3] onward) so the function needs no signature change
+                    entityType = components.count("RATIONAL_B_SPLINE_CURVE") ? "RATIONAL_B_SPLINE_CURVE" : "B_SPLINE_CURVE_WITH_KNOTS";
+                    entityParams = "'', " + components["B_SPLINE_CURVE"] + ", " + components["B_SPLINE_CURVE_WITH_KNOTS"];
+                    if (components.count("RATIONAL_B_SPLINE_CURVE"))
+                        entityParams += ", " + components["RATIONAL_B_SPLINE_CURVE"];
+                } else if (components.count("AXIS2_PLACEMENT_3D")) {
+                    entityType = "AXIS2_PLACEMENT_3D";
+                    entityParams = components["AXIS2_PLACEMENT_3D"];
+                }
+                if (!entityType.empty() && !entityParams.empty())
+                    entityMap[std::stoi(match[1])] = { entityType, entityParams };
+            }
             accumulator.clear();
         }
     }
@@ -122,6 +206,8 @@ Vec3 resolvePoint(int id, const StepMap& map)
     auto params = splitTopLevel(entityIt->second.params);
     // CARTESIAN_POINT params: (name, (x,y,z))
     // params[0] = name string (ex: "''"), params[1] = coordinate tuple "(1.0,2.0,3.0)"
+    // DIRECTION shares the exact same layout (name, (dx,dy,dz)) so this function resolves both without any type check,
+    // resolveAxis calls it for both the origin (CARTESIAN_POINT) and the two direction refs (DIRECTION) and it works for all of them
     if (params.size() < 2)
         throw std::runtime_error("CARTESIAN_POINT missing coords at #" + std::to_string(id));
     // unwrap "(1.0,2.0,3.0)" -> "1.0,2.0,3.0", then split to ["1.0","2.0","3.0"]
@@ -139,6 +225,10 @@ AxisPlacement resolveAxis(int id, const StepMap& map)
     // AXIS2_PLACEMENT_3D params: (name, origin_ref, z_dir_ref, x_dir_ref)
     // z and x direction refs point to DIRECTION entities (which share the CARTESIAN_POINT layout)
     // ex: "('', #10, #11, #12)" -> origin=point[10], zDirection=point[11], xDirection=point[12]
+    // entity type is not checked here, so AXIS, AXIS1_PLACEMENT, and compound-wrapped AXIS2_PLACEMENT_3D entities
+    // with the same (name, origin, z_dir[, x_dir]) layout are resolved correctly without special-casing,
+    // when x_dir_ref is absent (AXIS1_PLACEMENT with only 3 params) xDirection stays zero and tessPlane's
+    // Gram-Schmidt fallback builds a valid perpendicular automatically
     auto params = splitTopLevel(entityIt->second.params);
     if (params.size() < 3)
         throw std::runtime_error("AXIS2_PLACEMENT_3D missing params at #" + std::to_string(id));
@@ -254,7 +344,7 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
     return points;
 }
 
-// evaluate a B_SPLINE_CURVE_WITH_KNOTS using De Boor's algorithm
+// evaluate a B_SPLINE_CURVE_WITH_KNOTS or RATIONAL_B_SPLINE_CURVE (NURBS) using De Boor's algorithm
 // each round takes the current set of local control points and replaces them with a smaller set of blended points, until one point remains
 // basically what De Casteljau's algorithm is to Bézier curves, numerically stable and the standard way to evaluate splines
 // imagine you're mixing paint colors, you have a row of 4 paint pots, in the first round you blend each adjacent pair together, getting 3 new mixed colors,
@@ -265,6 +355,8 @@ static std::vector<Vec3> sampleCircle(int id, Vec3 startPt, Vec3 endPt, bool isC
 //        1234
 // where you start blending (the t parameter) determines how much of each neighbor contributes at each round, so starting near pot 1 gives a result close to
 // pot 1's color and starting near pot 5 gives a result close to pot 5's color, the final single color is the point on the curve at that parameter value
+// RATIONAL_B_SPLINE_CURVE (NURBS) extends the same pyramid with per-point weights: run De Boor in homogeneous 4D (x*w, y*w, z*w, w), divide back to 3D,
+// which lets it represent exact conics (circles, ellipses) that a non-rational B-spline can only approximate
 static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const StepMap& map, int arcSegs)
 {
     auto entityIt = map.find(id);
@@ -283,25 +375,29 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
     // knots = the t values where blending behavior changes, (0., 1.) combined with multiplicities (4,4) expands to (0,0,0,0,1,1,1,1),
     //      8 values for 4 pots at degree 3, satisfying the n + degree + 1 rule
     // knot_spec = knot distribution type (uniform, quasi-uniform...), .UNSPECIFIED. is almost always what you see in exported STEP files
+    // for RATIONAL_B_SPLINE_CURVE (synthesised from a compound entity), weights are appended as a fourth parenthesised list after knot_spec
+    bool isRational = (entityIt->second.type == "RATIONAL_B_SPLINE_CURVE");
     auto params = splitTopLevel(entityIt->second.params);
     if (params.size() < 3)
         return { startPt, endPt };
     int degree = (int)dbl(params[1]);
     std::vector<Vec3> controlPoints;
     for (auto& controlRef : splitTopLevel(unwrap(trimWS(params[2])))) {
-        int refId = stepRef(trimWS(controlRef));
+        int refId = stepRef(controlRef);
         if (refId > 0)
             controlPoints.push_back(resolvePoint(refId, map));
     }
     // need at least degree+1 pots to have enough neighbors to blend down to 1
     if ((int)controlPoints.size() <= degree)
         return { startPt, endPt };
-    // scan remaining params for the knot vector, skip the first parenthesised plain-float list (the multiplicity list)
-    // and accept the second one, which is the actual knot vector
-    // ex: 4 pots, degree 3 -> need 4+3+1=8 knots, ex: (0,0,0,0,1,1,1,1)
-    std::vector<double> knots;
+    // scan remaining params for up to three parenthesised float lists in STEP spec order:
+    //   first  = knot multiplicities (how many times each unique knot value repeats)
+    //   second = unique knot values (the actual t positions where blending behaviour changes)
+    //   third  = weights for rational curves (RATIONAL_B_SPLINE_CURVE only, absent for plain B-splines)
+    // non-numeric parenthesised lists (ex: ctrl_pt ref list already consumed at params[2]) are detected by the '#' prefix check and skipped
+    std::vector<double> multiplicityVector, uniqueKnots, weights;
     int floatListsSeen = 0;
-    for (int i = 3; i < (int)params.size() && knots.empty(); i++) {
+    for (int i = 3; i < (int)params.size(); i++) {
         std::string token = trimWS(params[i]);
         if (token.empty() || token[0] != '(')
             continue;
@@ -326,11 +422,31 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
         if (!allNumeric)
             continue;
         floatListsSeen++;
-        // first plain-float list = multiplicities, second = knots (STEP spec ordering)
-        if (floatListsSeen == 2 && (int)candidates.size() >= (int)controlPoints.size() + degree + 1)
-            knots = candidates;
+        // first plain-float list = multiplicities, second = unique knots (STEP spec ordering), third = weights for rational curves
+        if (floatListsSeen == 1)
+            multiplicityVector = candidates;
+        else if (floatListsSeen == 2)
+            uniqueKnots = candidates;
+        else if (floatListsSeen == 3)
+            weights = candidates;
     }
-    if (knots.empty())
+    // expand the knot vector, STEP B_SPLINE_CURVE_WITH_KNOTS stores (unique knot values, multiplicity counts) separately,
+    // De Boor needs the full repeated sequence where each unique knot appears multiplicity[k] times consecutively,
+    // a multiplicity-d cluster at each clamped endpoint forces the curve to interpolate the first and last control points exactly
+    // ex: multiplicities=(3,2,2,3), unique knots=(0.0, 0.5, 0.75, 1.0) -> expanded=(0,0,0, 0.5,0.5, 0.75,0.75, 1,1,1)
+    // fallback: if no second list was found but the first list is large enough, treat it as a pre-expanded knot vector
+    std::vector<double> knots;
+    if (!multiplicityVector.empty() && multiplicityVector.size() == uniqueKnots.size()) {
+        for (int k = 0; k < (int)uniqueKnots.size(); k++) {
+            int mult = std::max(1, (int)std::round(multiplicityVector[k]));
+            for (int j = 0; j < mult; j++)
+                knots.push_back(uniqueKnots[k]);
+        }
+    } else if (uniqueKnots.empty() && (int)multiplicityVector.size() >= (int)controlPoints.size() + degree + 1) {
+        // non-standard: first list is already the full expanded knot vector (no multiplicity encoding)
+        knots = multiplicityVector;
+    }
+    if (knots.empty() || (int)knots.size() < (int)controlPoints.size() + degree + 1)
         return { startPt, endPt };
     // valid blending range = [knots[degree], knots[n-1-degree]], outside this range there aren't enough pots on both sides to blend
     // ex: knots=(0,0,0,0,1,1,1,1), degree=3 -> tMin=knots[3]=0, tMax=knots[4]=1
@@ -361,6 +477,49 @@ static std::vector<Vec3> sampleBSpline(int id, Vec3 startPt, Vec3 endPt, const S
             }
         return localPoints[degree];
     };
+
+    if (isRational && weights.size() == controlPoints.size()) {
+        // each paint pot gets a stickiness value baked in, a sticky pot (w>1) pulls the final color toward itself more than a normal pot,
+        // to make the standard blending pyramid work with stickiness, pre-multiply each pot's color by its stickiness and carry the stickiness
+        // itself as a 4th channel (x*w, y*w, z*w, w), the pyramid blends all 4 channels identically to plain De Boor (same span-find and alpha formula),
+        // at the end divide the 3 color channels by the accumulated stickiness channel to recover the true color,
+        // a pot with w=1 contributes normally so this is a strict generalization (plain De Boor is just the w=1 case),
+        // ex: a degree-2 circular arc is encoded with weights (1, cos(half_angle), 1), the middle pot is slightly less sticky (w<1) which relaxes
+        // it away from the control polygon just enough to trace the exact circle, the non-rational path can only approximate this
+        std::vector<std::array<double, 4>> homogeneousPoints; // the "weighted pots"
+        homogeneousPoints.reserve(controlPoints.size());
+        for (int i = 0; i < (int)controlPoints.size(); i++) {
+            double weight = weights[i];
+            homogeneousPoints.push_back({ controlPoints[i].x * weight, controlPoints[i].y * weight, controlPoints[i].z * weight, weight });
+        }
+        auto deBoorRational = [&](double t) -> Vec3 {
+            int spanId = degree, lastSpan = (int)knots.size() - 2 - degree;
+            for (int i = degree; i < (int)knots.size() - 1 - degree; i++) {
+                if (t < knots[i + 1]) {
+                    spanId = i;
+                    break;
+                }
+                spanId = lastSpan;
+            }
+            std::vector<std::array<double, 4>> localPoints(homogeneousPoints.begin() + spanId - degree, homogeneousPoints.begin() + spanId + 1);
+            for (int r = 1; r <= degree; r++)
+                for (int j = degree; j >= r; j--) {
+                    double knotSpanWidth = knots[spanId - degree + j + r] - knots[spanId - degree + j];
+                    double alpha = (knotSpanWidth < 1e-12) ? 0.0 : (t - knots[spanId - degree + j]) / knotSpanWidth;
+                    for (int d = 0; d < 4; d++)
+                        localPoints[j][d] = localPoints[j - 1][d] * (1.0 - alpha) + localPoints[j][d] * alpha;
+                }
+            // project (x*w, y*w, z*w, w) back to (x, y, z), same degenerate sentinel guard as Vec3::norm
+            double w = localPoints[degree][3];
+            return (w > 1e-14) ? Vec3 { localPoints[degree][0] / w, localPoints[degree][1] / w, localPoints[degree][2] / w } : Vec3 { 0, 0, 1 };
+        };
+        std::vector<Vec3> points;
+        points.reserve(arcSegs + 1);
+        for (int i = 0; i <= arcSegs; i++)
+            points.push_back(deBoorRational(tMin + (tMax - tMin) * (double)i / arcSegs));
+        return points;
+    }
+
     // ask for the final mixed color at arcSegs+1 evenly spaced positions along the row of pots, from the first pot to the last,
     // and collecting all those colors into a list, that list is the polyline approximating the curve
     std::vector<Vec3> points;
@@ -404,7 +563,7 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
 
     // since EDGE_LOOP has multiple refs, start looping through each
     for (auto& edgeRef : splitTopLevel(unwrap(trimWS(loopParams[1])))) {
-        int orientedEdgeId = stepRef(trimWS(edgeRef));
+        int orientedEdgeId = stepRef(edgeRef);
         auto orientedEdgeIt = map.find(orientedEdgeId);
         if (orientedEdgeIt == map.end() || orientedEdgeIt->second.type != "ORIENTED_EDGE")
             continue;
@@ -461,7 +620,7 @@ BoundaryLoop sampleLoop(int boundId, const StepMap& map, int arcSegs)
                 edgeSamples = sampleCircle(curveId, vertexStart, vertexEnd, fullCircle, map, arcSegs, sameSense);
             else if (curveIt->second.type == "LINE")
                 edgeSamples = { vertexStart, vertexEnd }; // step calls lines "curves" (just straight ones)
-            else if (curveIt->second.type == "B_SPLINE_CURVE_WITH_KNOTS")
+            else if (curveIt->second.type == "B_SPLINE_CURVE_WITH_KNOTS" || curveIt->second.type == "RATIONAL_B_SPLINE_CURVE")
                 edgeSamples = sampleBSpline(curveId, vertexStart, vertexEnd, map, arcSegs);
             else
                 edgeSamples = { vertexStart, vertexEnd };

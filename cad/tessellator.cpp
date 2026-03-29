@@ -717,40 +717,6 @@ void retessCylinderFace(CadModel& model, int cylId, double newHeightMin, double 
     model.cylHeightRanges[cylId] = { newHeightMin, newHeightMax };
 }
 
-// checks if two faces share at least one vertex within eps (front-face vertices only)
-// used to confirm a plane and a cylinder are topologically connected at a cap, planeOff and cylOff are the current draw-space offsets of each face
-// could use our vec3.near but would be slightly worse because would calls sqrt per pair when all we need is to compare distance
-// not actually get them (so we dont need to sqrt)
-// back vertices are always exactly as many as front and stored contiguously after them (tessGrid and tessPlane both emit front then back),
-// so front_vertex_count = vertices.size()/3 / 2 = vertices.size()/6, base = i*3 then addresses XYZ within the front half only
-// if this invariant ever breaks, planeCount/cylCount will be wrong
-static bool facesShareVertex(const TessellatedFace& planeData, Vector3 planeOff, const TessellatedFace& cylData, Vector3 cylOff, float eps = 0.05f)
-{
-    int planeCount = (int)planeData.vertices.size() / 6;
-    int cylCount = (int)cylData.vertices.size() / 6;
-    float epsilon = eps * eps;
-    for (int i = 0; i < planeCount; i++) {
-        int baseP = i * 3;
-        float planeX = planeData.vertices[baseP] + planeOff.x;
-        float planeY = planeData.vertices[baseP + 1] + planeOff.y;
-        float planeZ = planeData.vertices[baseP + 2] + planeOff.z;
-        for (int j = 0; j < cylCount; j++) {
-            int baseC = j * 3;
-            float distanceX = planeX - (cylData.vertices[baseC] + cylOff.x);
-            float distanceY = planeY - (cylData.vertices[baseC + 1] + cylOff.y);
-            float distanceZ = planeZ - (cylData.vertices[baseC + 2] + cylOff.z);
-            // the sphere (your current best distance) fits inside a cube whose side equals the diameter, if you're already outside the cube on any single wall
-            // then you're outside the sphere, checking one wall costs one abs
-            // (which is cheaper than even a multiplication because it's just zeroing one bit of the float)
-            if (std::abs(distanceX) >= eps || std::abs(distanceY) >= eps || std::abs(distanceZ) >= eps)
-                continue;
-            if (distanceX * distanceX + distanceY * distanceY + distanceZ * distanceZ < epsilon)
-                return true;
-        }
-    }
-    return false;
-}
-
 // builds the heal cache for the selected plane face at gesture start, scans all cylinders once, checks axis alignment and vertex adjacency at the current
 // (initial) position, records which cap each connected cylinder should extend so per-frame updates need no proximity work at all
 std::vector<CylinderHealEntry> buildCylinderHealCache(const CadModel& model, int planeFaceId)

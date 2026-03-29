@@ -125,10 +125,6 @@ static bool clampDeltaForConstraints(const CadModel& model, int movingFace, Vect
     return clamped;
 }
 
-// applies the (already-clamped) delta transitively across the full constraint graph from movingFace, using DFS so constraint chains (face1->face2->face3) are
-// all resolved in one call, each hop derives the correct delta for the next face via derivedDelta (follow for Distance, mirror for Symmetry), cylinder healing
-// uses the per-face propagatedHealCaches map keyed by face index so each cylinder is healed exactly once with the correct delta for the face that caps it,
-// regardless of how many constraint pairs involve that face
 // computes and returns the mean STEP-space position of a face's front vertices (no centering, no offset),
 // used to populate rawFaceCentroids at load time and after retessellation
 Vector3 computeRawFaceCentroid(const TessellatedFace& face)
